@@ -221,6 +221,82 @@ function Indicator() {
   })
 }
 
+/**
+ * `::turn{}` — the in-transcript twin of the composer line.
+ *
+ * Rendered ONLY while the message is still streaming (the host passes
+ * `streaming`), so the line is gone the moment the turn settles. Nothing is
+ * shown when settled: the directive text is consumed by the claim, not
+ * reprinted, so an idle transcript simply loses that paragraph.
+ *
+ * `text="…"` overrides the label; it is untrusted model output, so it is
+ * trimmed and capped.
+ */
+function DirectiveLine({ attrs }) {
+  const activity = useValue($activity)
+  const boxRef = useRef(null)
+  const [since] = useState(() => Date.now())
+  const [, setTick] = useState(0)
+
+  useEffect(() => {
+    const id = window.setInterval(() => setTick(value => value + 1), 1000)
+    return () => window.clearInterval(id)
+  }, [])
+
+  useEffect(() => {
+    const el = boxRef.current
+
+    if (!el || typeof el.animate !== 'function') {
+      return
+    }
+
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      return
+    }
+
+    const animation = el.animate(
+      [
+        { opacity: 0.28, boxShadow: '0 0 0 0 var(--ui-accent)' },
+        { opacity: 1, boxShadow: '0 0 6px 1px var(--ui-accent)' },
+        { opacity: 0.28, boxShadow: '0 0 0 0 var(--ui-accent)' }
+      ],
+      { duration: 1500, iterations: Infinity, easing: 'ease-in-out' }
+    )
+
+    return () => animation.cancel()
+  }, [])
+
+  const override = typeof attrs?.text === 'string' ? attrs.text.trim().slice(0, 60) : ''
+  const seconds = Math.max(0, Math.floor((Date.now() - since) / 1000))
+
+  return jsx('span', {
+    'data-turn-indicator-inline': '',
+    role: 'status',
+    style: {
+      display: 'inline-flex',
+      width: 'fit-content',
+      alignItems: 'center',
+      gap: '6px',
+      margin: '2px 0',
+      padding: '2px 9px',
+      borderRadius: '999px',
+      border: '1px solid var(--ui-stroke-tertiary)',
+      background: 'var(--ui-bg-secondary)',
+      color: 'var(--ui-text-secondary)',
+      fontSize: '11px',
+      lineHeight: '1.5',
+      whiteSpace: 'nowrap',
+      fontVariantNumeric: 'tabular-nums',
+      userSelect: 'none'
+    },
+    children: [
+      jsx('span', { key: 'box', ref: boxRef, style: boxStyle }),
+      jsx('span', { key: 'label', children: override || activity || label() }),
+      jsx('span', { key: 'timer', style: { opacity: 0.7 }, children: `${seconds}s` })
+    ]
+  })
+}
+
 export default {
   id: ID,
   name: 'Turn indicator',
@@ -267,6 +343,18 @@ export default {
       // README): always the literal id.
       area: 'composer.top',
       render: () => jsx(Indicator, {})
+    })
+
+    // `::turn{}` — inline in the assistant bubble, visible only while that
+    // message streams. The name must be lowercase [a-z0-9-] and unique across
+    // plugins (first registration wins).
+    ctx.register({
+      id: 'turn-indicator-inline',
+      area: 'transcript.directives',
+      data: {
+        name: 'turn',
+        render: props => (props.streaming ? jsx(DirectiveLine, { attrs: props.attrs }) : null)
+      }
     })
 
     // ── Live label ───────────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ Hermes 桌面端（Electron）单文件插件：在输入框上方常驻一行"�
 | 内联读数（`composer.top`，输入框正上方、卡片内一行） | 方块 + 实时文案 + 秒数，整行宽度；空闲时不渲染 |
 | 文案 | 跟随真实动作：`思考中` / `编辑 plugin.js` / `执行命令` / `读取 a.md` / `搜索代码` / `查阅资料` / `生成回复` / `整理上下文` … |
 | 工具行 | 全部隐藏（`[data-slot="tool-block"]`），含 `+N −N` 编辑行与运行中进度 |
+| `::turn{}` 内联指令 | 模型在回复里写 `::turn{}`（或 `::turn{text="…"}`），该段在**流式期间**渲染成小胶囊，本轮结束即消失 |
 | 收尾卡「N 个文件已更改」 | 保持显示，不受影响 |
 | 审批卡 | 保持显示，必须由用户处理 |
 
@@ -45,6 +46,8 @@ cp plugin.js "$HERMES_HOME/desktop-plugins/turn-indicator/plugin.js"
 - **去抖**：`message.delta` 约 30 次/秒，同值不 set（nanostores 同值 set 也会通知）。
 - **样式清理**：`<style>` 不是 contribution，用 `ctx.onDispose` 挂掉，禁用/重载时移除。
 - **只用内联样式**：插件的类名不进 Tailwind 构建，用 `var(--ui-*)` 主题变量。
+- **`::turn{}` 指令**：`area: 'transcript.directives'`，`data.name = 'turn'`（小写、`[a-z0-9-]`、全局唯一，先注册者胜）。render 收到 `{ attrs, streaming }`：`streaming` 为 false 时返回 `null`，所以本轮一结束整段就没了。
+- **指令的代价**：模型没写 `::turn{}` 就不会出现；插件停用后没人认领这个名字，那段会退化成原文 `::turn{}` 显示在气泡里。
 
 ## 已知边界
 
