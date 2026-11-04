@@ -199,13 +199,15 @@ function Indicator() {
     role: 'status',
     style: {
       display: 'flex',
-      width: 'auto',
+      width: '100%',
       alignItems: 'center',
-      gap: '4px',
-      padding: '0',
+      gap: '6px',
+      // A full-width line inside the composer card: no pill chrome, it reads as
+      // part of the input box.
+      padding: '1px 2px 0',
       color: 'var(--ui-text-secondary)',
-      fontSize: '10.5px',
-      lineHeight: '1.4',
+      fontSize: '11px',
+      lineHeight: '1.5',
       whiteSpace: 'nowrap',
       fontVariantNumeric: 'tabular-nums',
       userSelect: 'none',
@@ -257,15 +259,13 @@ export default {
       }
     }
 
-    // Inline, next to the composer's "+" menu: a bare small readout, so the
-    // component renders nothing at all when the turn is idle (unlike a floating
-    // pane, there is no host card left behind).
+    // Banner strip above the textarea, inside the composer card. The slot's
+    // wrapper is `empty:hidden`, so an idle return null leaves no gap.
     ctx.register({
       id: 'turn-indicator-strip',
-      // Area constants are NOT exported by the runtime SDK (both
-      // `PANES_AREA` and `COMPOSER_AREAS` throw "X is not defined" — the
-      // built barrel is narrower than the source), so area ids are literals.
-      area: 'composer.leading',
+      // Area constants are not exported by the runtime SDK (see the note in
+      // README): always the literal id.
+      area: 'composer.top',
       render: () => jsx(Indicator, {})
     })
 
