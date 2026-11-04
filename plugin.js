@@ -324,7 +324,13 @@ export default {
       // the row's inline `tool-progress` span (fallback.tsx:362) — one rule
       // covers both, since the progress text lives inside the row's header.
       // Approval cards are NOT touched — the user has to answer those.
-      style.textContent = '[data-slot="tool-block"] { display: none !important; }'
+      style.textContent =
+        // settled history: no tool rows at all
+        '[data-slot="tool-block"] { display: none !important; }\n' +
+        // …but the message that is RUNNING shows its rows. The marker span is
+        // `display:none` yet still matches `:has()`, which is exactly how core
+        // advertises "this bubble is streaming" (assistant-message.tsx:565).
+        '[data-slot="aui_assistant-message-root"]:has([data-message-streaming="true"]) [data-slot="tool-block"] { display: block !important; }'
 
       // The <style> is not a registered contribution, so disabling the plugin
       // would leave it in the document until the window reloads. Tie it to the
@@ -333,6 +339,23 @@ export default {
       if (typeof ctx.onDispose === 'function') {
         ctx.onDispose(() => style.remove())
       }
+
+      // TEMP PROBE — sample tool-row visibility + inline directive each second.
+      let tick = 0
+      const sampler = window.setInterval(() => {
+        tick += 1
+        const inline = document.querySelectorAll('[data-turn-indicator-inline]').length
+        const blocks = [...document.querySelectorAll('[data-slot="tool-block"]')]
+        const visible = blocks.filter(el => el.getClientRects().length > 0).length
+        const markers = document.querySelectorAll('[data-message-streaming="true"]').length
+        console.error(
+          '[turn-indicator] sample#' + tick + ' inline=' + inline +
+            ' toolBlocks=' + blocks.length + ' visible=' + visible + ' runningMarkers=' + markers
+        )
+        if (tick >= 60) {
+          window.clearInterval(sampler)
+        }
+      }, 1000)
     }
 
     // Banner strip above the textarea, inside the composer card. The slot's
