@@ -136,19 +136,6 @@ function Indicator() {
   // what the streaming marker could not do.
   useEffect(() => {
     document.documentElement.dataset.turnWorking = working ? 'true' : 'false'
-
-    if (working) {
-      return
-    }
-
-    // TEMP PROBE — after the turn ends, the rows must be gone again.
-    const id = window.setTimeout(() => {
-      const blocks = [...document.querySelectorAll('[data-slot="tool-block"]')]
-      console.error('[turn-indicator] settled attr=' + document.documentElement.dataset.turnWorking +
-        ' blocks=' + blocks.length + ' visible=' + blocks.filter(el => el.getClientRects().length > 0).length)
-    }, 1500)
-
-    return () => window.clearTimeout(id)
   }, [working])
 
   const boxRef = useRef(null)
