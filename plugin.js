@@ -24,7 +24,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { jsx } from 'react/jsx-runtime'
-import { atom, COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
+import { atom, host, useValue } from '@hermes/plugin-sdk'
 
 const ID = 'turn-indicator'
 
@@ -185,11 +185,10 @@ function Indicator() {
   void tick
   const elapsed = turnSeconds(since)
 
-  // Idle: render nothing at all. The strip's wrapper is `empty:hidden`, so it
-  // collapses instead of leaving a gap under the composer.
-  if (!working) {
-    return null
-  }
+  // Idle still renders: a floating pane's card chrome is owned by the host and
+  // stays on screen, so returning null would leave an empty card. An explicit
+  // "idle" line is the honest state for that surface.
+  const text = working ? activity || label() : zh('空闲', 'Idle')
 
   return jsx('div', {
     'aria-live': 'polite',
@@ -199,9 +198,7 @@ function Indicator() {
       width: '100%',
       alignItems: 'center',
       gap: '6px',
-      // composer.top sits INSIDE the input card, above the textarea: a bare
-      // line reads as part of the card, a pill would look like a second chip.
-      padding: '1px 2px 0',
+      padding: '2px 4px',
       color: 'var(--ui-text-secondary)',
       fontSize: '11px',
       lineHeight: '1.55',
@@ -211,8 +208,8 @@ function Indicator() {
     },
     children: [
       jsx('span', { key: 'box', ref: boxRef, style: boxStyle }),
-      jsx('span', { key: 'label', children: activity || label() }),
-      jsx('span', { key: 'timer', style: { opacity: 0.7 }, children: `${elapsed}s` })
+      jsx('span', { key: 'label', children: text }),
+      working ? jsx('span', { key: 'timer', style: { opacity: 0.7 }, children: `${elapsed}s` }) : null
     ]
   })
 }
@@ -255,13 +252,16 @@ export default {
       }
     }
 
-    // Registered once, permanently: the component itself renders null while the
-    // chat is idle, and `empty:hidden` collapses the strip. Doing it this way
-    // keeps every subscription inside React (useValue), so a reload cannot
-    // leave a stale host listener behind.
+    // A floating pane: the host draws its card (header + drag + persisted
+    // position), so the component must ALWAYS render something — an idle line
+    // instead of null, or the card would sit empty.
     ctx.register({
       id: 'turn-indicator-strip',
-      area: COMPOSER_AREAS.top,
+      // SDK does not export PANES_AREA at runtime (importing it throws
+      // "PANES_AREA is not defined"), so the literal is the supported form.
+      area: 'panes',
+      title: '运行状态',
+      data: { placement: 'floating', anchor: 'bottom-right', width: 210, height: 62 },
       render: () => jsx(Indicator, {})
     })
 
