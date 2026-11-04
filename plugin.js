@@ -185,23 +185,28 @@ function Indicator() {
   void tick
   const elapsed = turnSeconds(since)
 
-  // Idle still renders: a floating pane's card chrome is owned by the host and
-  // stays on screen, so returning null would leave an empty card. An explicit
-  // "idle" line is the honest state for that surface.
-  const text = working ? activity || label() : zh('空闲', 'Idle')
+  // Inline slot beside the "+" menu: idle renders nothing (the slot is a bare
+  // inline strip, not a host card that would be left empty).
+  if (!working) {
+    return null
+  }
+
+  const text = activity || label()
 
   return jsx('div', {
     'aria-live': 'polite',
+    'data-turn-indicator': '',
     role: 'status',
     style: {
       display: 'flex',
-      width: '100%',
+      width: 'auto',
       alignItems: 'center',
-      gap: '6px',
-      padding: '2px 4px',
+      gap: '4px',
+      padding: '0',
       color: 'var(--ui-text-secondary)',
-      fontSize: '11px',
-      lineHeight: '1.55',
+      fontSize: '10.5px',
+      lineHeight: '1.4',
+      whiteSpace: 'nowrap',
       fontVariantNumeric: 'tabular-nums',
       userSelect: 'none',
       pointerEvents: 'none'
@@ -252,16 +257,15 @@ export default {
       }
     }
 
-    // A floating pane: the host draws its card (header + drag + persisted
-    // position), so the component must ALWAYS render something — an idle line
-    // instead of null, or the card would sit empty.
+    // Inline, next to the composer's "+" menu: a bare small readout, so the
+    // component renders nothing at all when the turn is idle (unlike a floating
+    // pane, there is no host card left behind).
     ctx.register({
       id: 'turn-indicator-strip',
-      // SDK does not export PANES_AREA at runtime (importing it throws
-      // "PANES_AREA is not defined"), so the literal is the supported form.
-      area: 'panes',
-      title: '运行状态',
-      data: { placement: 'floating', anchor: 'bottom-right', width: 210, height: 62 },
+      // Area constants are NOT exported by the runtime SDK (both
+      // `PANES_AREA` and `COMPOSER_AREAS` throw "X is not defined" — the
+      // built barrel is narrower than the source), so area ids are literals.
+      area: 'composer.leading',
       render: () => jsx(Indicator, {})
     })
 

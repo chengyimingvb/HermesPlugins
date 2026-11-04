@@ -8,8 +8,7 @@ Hermes 桌面端（Electron）单文件插件：在输入框上方常驻一行"�
 
 | 元素 | 行为 |
 |---|---|
-| 悬浮卡（`placement: 'floating'`，默认右下角 210×62） | 标题「运行状态」+ 一行状态；可拖动、可折叠，位置持久化 |
-| 正文 | 本轮进行中显示实时文案 + 秒数；空闲显示「空闲」 |
+| 内联读数（`composer.leading`，输入框「+」按钮右侧） | 小号方块 + 实时文案 + 秒数；空闲时整块不渲染 |
 | 文案 | 跟随真实动作：`思考中` / `编辑 plugin.js` / `执行命令` / `读取 a.md` / `搜索代码` / `查阅资料` / `生成回复` / `整理上下文` … |
 | 工具行 | 全部隐藏（`[data-slot="tool-block"]`），含 `+N −N` 编辑行与运行中进度 |
 | 收尾卡「N 个文件已更改」 | 保持显示，不受影响 |
@@ -38,9 +37,9 @@ cp plugin.js "$HERMES_HOME/desktop-plugins/turn-indicator/plugin.js"
 
 ## 实现要点
 
-- **挂载点**：`area: 'panes'` + `data: { placement: 'floating', anchor: 'bottom-right', width, height }`。floating 不进布局树、无标签页、不占任何分区宽度，宿主画卡片外壳（标题栏即拖拽把手 + 折叠按钮），位置按 pane id 持久化。
-- **注意**：SDK 运行时**没有**导出 `PANES_AREA`，`import { PANES_AREA }` 会抛 `ReferenceError: PANES_AREA is not defined`；用字面量 `'panes'`。
-- **卡片常驻**：外壳属于宿主，空闲时组件不能返回 `null`，否则是空卡片；改为渲染「空闲」并隐藏秒数。
+- **挂载点**：`area: 'composer.leading'` —— 输入框控制行里「+」菜单右侧的内联位置，宽度自适应，空闲时不渲染。
+- **注意**：SDK 运行时**没有**导出区域常量（`PANES_AREA`、`COMPOSER_AREAS` 都会抛 `ReferenceError: X is not defined`，构建后的 barrel 比源码窄），所以 area id 一律写字面量。
+- **样式**：`width: auto` + `white-space: nowrap` + 10.5px，避免挤占输入行；文案长时会占更多横向空间。
 - **动画**：Web Animations API（`element.animate` + `iterations: Infinity`），插件没有自己的样式表；尊重 `prefers-reduced-motion`。
 - **文案来源**：`ctx.onEvent` 订阅 `tool.start` / `tool.complete` / `tool.generating` / `message.delta` / `thinking.delta` / `status.update` / `message.complete`，按 `event.session_id` 只认聚焦会话，丢弃 `replayed` 帧。
 - **去抖**：`message.delta` 约 30 次/秒，同值不 set（nanostores 同值 set 也会通知）。
