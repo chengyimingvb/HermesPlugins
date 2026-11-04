@@ -130,6 +130,27 @@ function Indicator() {
   const activity = useValue($activity)
   const working = Boolean(busy || (focusedSessionId && (busyBySession || {})[focusedSessionId]))
 
+  // Publish the busy state on <html> so the stylesheet can reveal this chat's
+  // tool rows for the length of the turn (and take them away the moment it
+  // ends). A class on the document outlives per-message re-renders, which is
+  // what the streaming marker could not do.
+  useEffect(() => {
+    document.documentElement.dataset.turnWorking = working ? 'true' : 'false'
+
+    if (working) {
+      return
+    }
+
+    // TEMP PROBE — after the turn ends, the rows must be gone again.
+    const id = window.setTimeout(() => {
+      const blocks = [...document.querySelectorAll('[data-slot="tool-block"]')]
+      console.error('[turn-indicator] settled attr=' + document.documentElement.dataset.turnWorking +
+        ' blocks=' + blocks.length + ' visible=' + blocks.filter(el => el.getClientRects().length > 0).length)
+    }, 1500)
+
+    return () => window.clearTimeout(id)
+  }, [working])
+
   const boxRef = useRef(null)
   const [since, setSince] = useState(() => (working ? Date.now() : null))
   const [tick, setTick] = useState(0)
@@ -327,10 +348,12 @@ export default {
       style.textContent =
         // settled history: no tool rows at all
         '[data-slot="tool-block"] { display: none !important; }\n' +
-        // …but the message that is RUNNING shows its rows. The marker span is
-        // `display:none` yet still matches `:has()`, which is exactly how core
-        // advertises "this bubble is streaming" (assistant-message.tsx:565).
-        '[data-slot="aui_assistant-message-root"]:has([data-message-streaming="true"]) [data-slot="tool-block"] { display: block !important; }'
+        // …while THIS chat is working, show them. Driven by the plugin's own
+        // busy signal (`html[data-turn-working]`), not by the per-message
+        // streaming marker: core only stamps that marker on the placeholder
+        // bubble, so tool-call segments that settle between calls lost their
+        // rows mid-turn — the "执行命令 but no steps" bug.
+        'html[data-turn-working="true"] [data-slot="tool-block"] { display: block !important; }'
 
       // The <style> is not a registered contribution, so disabling the plugin
       // would leave it in the document until the window reloads. Tie it to the
@@ -340,23 +363,8 @@ export default {
         ctx.onDispose(() => style.remove())
       }
 
-      // TEMP PROBE — sample tool-row visibility + inline directive each second.
-      let tick = 0
-      const sampler = window.setInterval(() => {
-        tick += 1
-        const inline = document.querySelectorAll('[data-turn-indicator-inline]').length
-        const blocks = [...document.querySelectorAll('[data-slot="tool-block"]')]
-        const visible = blocks.filter(el => el.getClientRects().length > 0).length
-        const markers = document.querySelectorAll('[data-message-streaming="true"]').length
-        console.error(
-          '[turn-indicator] sample#' + tick + ' inline=' + inline +
-            ' toolBlocks=' + blocks.length + ' visible=' + visible + ' runningMarkers=' + markers
-        )
-        if (tick >= 60) {
-          window.clearInterval(sampler)
-        }
-      }, 1000)
     }
+
 
     // Banner strip above the textarea, inside the composer card. The slot's
     // wrapper is `empty:hidden`, so an idle return null leaves no gap.
