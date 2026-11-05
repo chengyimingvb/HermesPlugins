@@ -17,24 +17,32 @@ Hermes 桌面端（Electron）单文件插件：在输入框上方常驻一行"�
 
 ## 安装
 
-插件是**纯前端 ESM**，无需构建：
+两种方式，插件是**纯前端 ESM**，无需构建。
+
+**A. 从 GitHub 装（推荐）**
+
+```bash
+hermes plugins install chengyimingvb/HermesPlugins/turn-indicator
+```
+
+装完在桌面端 Settings → Plugins 里打开这个插件（包内 desktop 半边默认关闭）。之后保存 `plugin.js` 即热重载。
+
+**B. 手动拷贝**
 
 ```bash
 # Windows 默认（本机）
-copy plugin.js "%LOCALAPPDATA%\hermes\desktop-plugins\turn-indicator\plugin.js"
+copy desktop/plugin.js "%LOCALAPPDATA%\hermes\desktop-plugins\turn-indicator\plugin.js"
 
 # 或 $HERMES_HOME 下
 mkdir -p "$HERMES_HOME/desktop-plugins/turn-indicator"
-cp plugin.js "$HERMES_HOME/desktop-plugins/turn-indicator/plugin.js"
+cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/turn-indicator/plugin.js"
 ```
 
 文件夹名必须等于插件 `id`（`turn-indicator`）。放好后在应用里按 `⌘K` → **Reload desktop plugins**；首次是全新文件夹，热重载不保证自动发现。
 
-保存 `plugin.js` 即热重载，无需重启。
-
 ## 卸载
 
-删掉 `desktop-plugins/turn-indicator/` 目录，或 Settings → Plugins 里禁用。
+`hermes plugins remove turn-indicator`；或删掉 `desktop-plugins/turn-indicator/` 目录；或 Settings → Plugins 里禁用。
 
 ## 实现要点
 
@@ -59,9 +67,9 @@ cp plugin.js "$HERMES_HOME/desktop-plugins/turn-indicator/plugin.js"
 ## 目录
 
 ```
-plugin.js          # 全部逻辑（单文件 ESM）
+plugin.yaml        # 插件清单（name / version / requires_hermes）
+desktop/plugin.js  # 全部逻辑（单文件 ESM）
 README.md          # 本文件
-.gitattributes     # 行尾规范，避免 Windows CRLF 把 .sh/.json 签出坏掉
 ```
 
 ## 兼容性

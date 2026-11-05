@@ -35,15 +35,23 @@ Hermes 没有会话级只读策略，插件也改不了系统提示（会破坏 
 纯前端 ESM，无需构建：
 
 ```bash
+hermes plugins install chengyimingvb/HermesPlugins/read-only-mode
+```
+
+装完在桌面端 Settings → Plugins 里打开这个插件（包内 desktop 半边默认关闭）。
+
+手动拷贝：
+
+```bash
 mkdir -p "$HERMES_HOME/desktop-plugins/read-only-mode"
-cp plugin.js "$HERMES_HOME/desktop-plugins/read-only-mode/plugin.js"
+cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/read-only-mode/plugin.js"
 ```
 
 文件夹名必须等于插件 `id`（`read-only-mode`）。新目录不保证自动发现：放好后 ⌘K → **Reload desktop plugins**。之后保存 `plugin.js` 即热重载。
 
 ## 卸载
 
-删掉 `desktop-plugins/read-only-mode/`，或 Settings → Plugins 里禁用。
+`hermes plugins remove read-only-mode`；或删掉 `desktop-plugins/read-only-mode/`；或 Settings → Plugins 里禁用。
 
 ## 实现要点
 
@@ -64,8 +72,9 @@ cp plugin.js "$HERMES_HOME/desktop-plugins/read-only-mode/plugin.js"
 ## 目录
 
 ```
-plugin.js    # 全部逻辑（单文件 ESM）
-README.md    # 本文件
+plugin.yaml        # 插件清单（name / version / requires_hermes）
+desktop/plugin.js  # 全部逻辑（单文件 ESM）
+README.md          # 本文件
 ```
 
 ## 兼容性
