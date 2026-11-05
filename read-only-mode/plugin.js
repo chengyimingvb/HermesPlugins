@@ -52,44 +52,59 @@ const body = () =>
       'confirmation.'
   )
 
-/** Whether the toggle is on. Module-level on purpose: one switch for every
- *  composer instance (sessions, tiles, the fresh draft), mirrored to
- *  `ctx.storage` so it survives a reload. */
-const $on = atom(false)
+/** Per-SESSION switch state: `{ [sessionId]: true }`. Omitted key = off, so the
+ *  map never grows for chats that never used the toggle. Mirrored to
+ *  `ctx.storage` so it survives a reload.
+ *
+ *  Why `host.state.focusedSessionId` is the key on BOTH ends: the composer's
+ *  middleware handler receives only `{ text, attachments }` (contrib.ts
+ *  `ComposerDraft`; use-middleware-submit.ts builds it from the bare value), so
+ *  a plugin cannot learn which composer submitted. The focused chat is the one
+ *  the user is typing in, which is the same chat this slot's button renders
+ *  for — one helper, two call sites, no way for them to disagree. */
+const KEY_NEW = 'new'
+
+const $states = atom({})
+
+const sessionKey = () => host.state.focusedSessionId.get() || KEY_NEW
+
+const isOn = (map, key) => Boolean((map || {})[key])
 
 /** The live ctx, captured by register(). Module scope (not a render closure) so
  *  the click handler always reaches the ctx of the CURRENT module instance. */
 let pluginCtx = null
 
-const setMode = (next, ctx = pluginCtx) => {
+const setMode = (key, next, ctx = pluginCtx) => {
   const value = Boolean(next)
+  const current = $states.get() || {}
 
-  if ($on.get() === value) {
+  if (isOn(current, key) === value) {
     return
   }
 
-  $on.set(value)
+  const updated = { ...current }
+
+  if (value) {
+    updated[key] = true
+  } else {
+    delete updated[key]
+  }
+
+  $states.set(updated)
 
   try {
-    ctx?.storage?.set(STORAGE_KEY, value)
+    ctx?.storage?.set(STORAGE_KEY, updated)
   } catch {
     // A storage refusal must not break the toggle itself.
   }
-
-  host.notify({
-    kind: value ? 'success' : 'info',
-    message: value
-      ? zh('只读模式已开启：发送的消息会带上"只读、不改文件"的约束', 'Read-only mode on: sends carry a no-writes directive')
-      : zh('只读模式已关闭：恢复正常读写', 'Read-only mode off: normal read/write')
-  })
 }
 
-/** The `composer.middleware` handler: prepend the directive, pass through
- *  otherwise. Returning the draft untouched keeps the chain byte-identical
- *  when the toggle is off (an empty-text send, e.g. attachments only, is never
- *  prefixed). */
+/** The `composer.middleware` handler: prepend the directive when THIS chat has
+ *  the toggle on, pass through otherwise. Returning the draft untouched keeps
+ *  the chain byte-identical for every other session (and for an empty-text send,
+ *  e.g. attachments only, which is never prefixed). */
 const middleware = draft => {
-  if (!$on.get()) {
+  if (!isOn($states.get(), sessionKey())) {
     return draft
   }
 
@@ -103,9 +118,12 @@ const middleware = draft => {
 }
 
 function Toggle() {
-  const on = useValue($on)
+  const states = useValue($states)
+  const focusedSessionId = useValue(host.state.focusedSessionId)
+  const key = focusedSessionId || KEY_NEW
+  const on = isOn(states, key)
   const label = on
-    ? zh('只读模式：已开启（不改文件）', 'Read-only mode: on')
+    ? zh('只读模式：已开启（本会话不改文件）', 'Read-only mode: on for this chat')
     : zh('只读模式：关闭', 'Read-only mode: off')
 
   return jsx(Tip, {
@@ -118,7 +136,7 @@ function Toggle() {
       // The composer's own ghost icon-button recipe, so the control matches the
       // `+` beside it (size comes from --composer-control-size).
       className: GHOST_ICON_BTN,
-      onClick: () => setMode(!$on.get()),
+      onClick: () => setMode(key, !on),
       size: 'icon',
       // Inline, theme-var only: a plugin's Tailwind classes are not in the
       // app's compiled stylesheet, so the ON state cannot be a utility class.
@@ -143,15 +161,19 @@ export default {
     // handler, and a reload swaps the module instance.
     pluginCtx = ctx
 
-    let stored = false
+    let stored = {}
 
     try {
-      stored = Boolean(ctx.storage?.get(STORAGE_KEY, false))
+      const raw = ctx.storage?.get(STORAGE_KEY, {})
+
+      // v1 stored a single boolean for "every chat"; drop it rather than
+      // migrating one chat's state onto another's.
+      stored = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
     } catch {
-      stored = false
+      stored = {}
     }
 
-    $on.set(stored)
+    $states.set(stored)
 
     // Inline, after the "+" menu (grid-area: menu, items-start) — the row cell
     // sized for an icon button, so it costs the input grid nothing.
@@ -175,7 +197,7 @@ export default {
         id: 'read-only-mode.toggle',
         label: 'Read-only mode: toggle',
         keywords: ['read-only', 'readonly', '只读', '问答', 'ask'],
-        run: () => setMode(!$on.get(), ctx)
+        run: () => setMode(sessionKey(), !isOn($states.get(), sessionKey()), ctx)
       }
     })
   }
