@@ -16,6 +16,12 @@ hermes plugins install chengyimingvb/HermesPlugins/read-only-mode
 
 装完在桌面端 **Settings → Plugins** 里打开插件（包内 desktop 半边默认关闭）。卸载：`hermes plugins remove <id>`。
 
+需要可复现的安装（锁到某个提交，`hermes plugins list` 不再报 `provenance: drift`）时加 `--ref <40 位 SHA>`：
+
+```bash
+hermes plugins install chengyimingvb/HermesPlugins/turn-indicator --ref <commit-sha>
+```
+
 也可以手动把 `<id>/desktop/plugin.js` 拷到 `$HERMES_HOME/desktop-plugins/<id>/plugin.js`，然后 ⌘K → **Reload desktop plugins**。
 
 ## 结构
