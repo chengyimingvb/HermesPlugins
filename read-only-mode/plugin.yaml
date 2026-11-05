@@ -1,0 +1,7 @@
+name: read-only-mode
+version: "0.1.0"
+description: Ask/read-only toggle beside the desktop composer — each send carries a read-only instruction the model sees as the opening line of the user turn.
+author: CY
+license: MIT
+requires_hermes: ">=0.22.7"
+capabilities: {}

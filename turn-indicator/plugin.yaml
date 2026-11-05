@@ -1,0 +1,7 @@
+name: turn-indicator
+version: "0.1.0"
+description: Always-on turn indicator in the desktop composer — one pulse, a live activity label and a per-turn timer, with a `::turn{}` inline twin.
+author: CY
+license: MIT
+requires_hermes: ">=0.22.7"
+capabilities: {}
