@@ -50,6 +50,10 @@ function DiffBody({ text }) {
 
 function GitPane() {
   const cwd = useValue(host.state.cwd)
+  // Sessions switch within one workspace without moving cwd: follow the focused chat too.
+  const sessionId = useValue(host.state.focusedSessionId)
+  const storedSessionId = useValue(host.state.focusedStoredSessionId)
+  const sessionKey = sessionId || storedSessionId || ''
   const cwdName = baseName(cwd)
   const [repos, setRepos] = useState([])
   const [repo, setRepo] = useState('')
@@ -117,7 +121,7 @@ function GitPane() {
     setRepo('')
     setDiff(null)
     if (cwd) void scan(cwd)
-  }, [cwd, scan])
+  }, [cwd, sessionKey, scan])
 
   const onPick = useCallback((path, on) => {
     setPicked((prev) => (on ? [...new Set([...prev, path])] : prev.filter((p) => p !== path)))
