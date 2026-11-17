@@ -3,7 +3,7 @@
 
 import { host, useValue, Button, Textarea, Dialog, DialogContent, DialogHeader, DialogTitle } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 let rest = null
 
@@ -50,11 +50,12 @@ function DiffBody({ text }) {
 
 function GitPane() {
   const cwd = useValue(host.state.cwd)
-  // Sessions switch within one workspace without moving cwd: follow the focused chat too.
+  // Sessions switch within one workspace without moving cwd, and host.state.cwd tracks the
+  // primary chat — so resolve the FOCUSED chat's own cwd over RPC and fall back to cwd.
   const sessionId = useValue(host.state.focusedSessionId)
   const storedSessionId = useValue(host.state.focusedStoredSessionId)
   const sessionKey = sessionId || storedSessionId || ''
-  const cwdName = baseName(cwd)
+  const cwdCache = useRef(new Map())
   const [repos, setRepos] = useState([])
   const [repo, setRepo] = useState('')
   const [status, setStatus] = useState(null)
@@ -62,6 +63,10 @@ function GitPane() {
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState('')
   const [diff, setDiff] = useState(null)
+  // Workspace of the focused chat (falls back to the window cwd) — what the pane acts on.
+  const [workspace, setWorkspace] = useState('')
+  const base = workspace || cwd
+  const cwdName = baseName(base)
 
   const toast = useCallback((message, kind = 'info') => {
     host.notify({ kind, message })
@@ -114,14 +119,36 @@ function GitPane() {
   }, [refresh])
 
   useEffect(() => {
+    let cancelled = false
     setStatus(null)
     setPicked([])
     setMessage('')
     setRepos([])
     setRepo('')
     setDiff(null)
-    if (cwd) void scan(cwd)
-  }, [cwd, sessionKey, scan])
+    void (async () => {
+      let target = cwd
+      if (sessionKey) {
+        const cached = cwdCache.current.get(sessionKey)
+        if (cached) target = cached
+        else if (sessionId) {
+          try {
+            const info = await host.request('session.info', { session_id: sessionId })
+            if (info && info.cwd) {
+              cwdCache.current.set(sessionKey, info.cwd)
+              target = info.cwd
+            }
+          } catch (err) {
+            console.warn('[git-ops] session.info', err && err.message)
+          }
+        }
+      }
+      if (cancelled) return
+      setWorkspace(target || '')
+      if (target) await scan(target)
+    })()
+    return () => { cancelled = true }
+  }, [cwd, sessionKey, sessionId, scan])
 
   const onPick = useCallback((path, on) => {
     setPicked((prev) => (on ? [...new Set([...prev, path])] : prev.filter((p) => p !== path)))
@@ -132,12 +159,12 @@ function GitPane() {
     setDiff({ path, text: '加载中…', truncated: false })
     try {
       const d = await api(`/diff?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`
-        + `&cwd=${encodeURIComponent(cwd || repo)}`)
+        + `&cwd=${encodeURIComponent(base || repo)}`)
       setDiff({ path: d.path, text: d.diff, truncated: d.truncated })
     } catch (err) {
       setDiff({ path, text: '无法读取 diff: ' + err.message, truncated: false })
     }
-  }, [repo, cwd])
+  }, [repo, base])
 
   const run = useCallback(async (kind, path, body, describe, notify = false) => {
     setBusy(kind)
@@ -156,33 +183,33 @@ function GitPane() {
 
   const generate = useCallback(async () => {
     if (!repo) return
-    const data = await run('info', '/commit-info', { repo, paths: picked, cwd },
+    const data = await run('info', '/commit-info', { repo, paths: picked, cwd: base },
       (d) => `生成 ${d.header}${d.truncated ? ' (diff 已截断)' : ''}`, true)
     if (data) setMessage(data.message)
-  }, [repo, picked, cwd, run])
+  }, [repo, picked, base, run])
 
   const commitAndPush = useCallback(async () => {
     if (!repo) return
     const committed = await run('commit', '/commit',
-      { repo, paths: picked, message: message.trim() ? message : '', cwd },
+      { repo, paths: picked, message: message.trim() ? message : '', cwd: base },
       (d) => `已提交 ${d.short} ${d.header}`, true)
     if (!committed) return
     setMessage('')
-    const pushed = await run('push', '/push', { repo, cwd },
+    const pushed = await run('push', '/push', { repo, cwd: base },
       (d) => (d.verified ? `已推送 ${d.short} (verified)` : `推送未确认 ${d.short} ahead=${d.ahead_after}`), true)
     await refresh(repo)
     if (!pushed) toast('提交已保存，但推送失败', 'warning')
-  }, [repo, picked, message, cwd, run, refresh, toast])
+  }, [repo, picked, message, base, run, refresh, toast])
 
   const doPull = useCallback(async () => {
     if (!repo) {
       console.warn('[git-ops] pull skipped: no repo in the current workspace')
       return
     }
-    const data = await run('pull', '/pull', { repo, cwd, submodules: true },
+    const data = await run('pull', '/pull', { repo, cwd: base, submodules: true },
       (d) => (d.pulled ? `拉取 ${d.pulled} 个提交 ${d.old}→${d.new}` : '已是最新'))
     if (data) await refresh(repo)
-  }, [repo, cwd, run, refresh])
+  }, [repo, base, run, refresh])
 
   const repoReady = Boolean(repo) && repos.some((r) => r.path === repo)
   const disabled = !repoReady || Boolean(busy)
@@ -195,13 +222,13 @@ function GitPane() {
           jsx('div', {
             className: 'h-7 flex-1 truncate rounded border px-2 py-1 text-xs',
             style: { ...STROKE, ...MONO, color: 'var(--ui-text-secondary)' },
-            title: cwd || '',
+            title: base || '',
             children: cwdName || '(无激活工作区)'
           }),
           jsx(Button, {
             size: 'sm', variant: 'secondary',
-            onClick: () => scan(cwd),
-            disabled: Boolean(busy) || !cwd,
+            onClick: () => scan(base),
+            disabled: Boolean(busy) || !base,
             children: busy === 'scan' ? '扫描中…' : '刷新'
           })
         ]
