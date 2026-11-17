@@ -65,6 +65,19 @@ def status(repo: str = Query("."), cwd: str = Query("")) -> dict[str, Any]:
     return _envelope(gitops.status, repo, _base(cwd))
 
 
+@router.get("/diff")
+def diff(repo: str = Query("."), path: str = Query(""), cwd: str = Query("")) -> dict[str, Any]:
+    def _one() -> dict[str, Any]:
+        if not path:
+            raise gitops.GitOpsError("path is required")
+        top = gitops.resolve_repo(repo, _base(cwd))
+        text, _files, truncated = gitops._diff(top, [path])
+        if not text.strip():
+            raise gitops.GitOpsError(f"no diff for {path} (unchanged, or binary)")
+        return {"path": path, "diff": text, "truncated": truncated}
+    return _envelope(_one)
+
+
 @router.post("/commit-info")
 def commit_info(payload: dict = Body(...)) -> dict[str, Any]:
     repo = payload.get("repo") or "."

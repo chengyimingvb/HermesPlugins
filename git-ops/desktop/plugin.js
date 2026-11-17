@@ -1,7 +1,7 @@
 // git-ops desktop half — repo discovery, status, generated commit message, commit / push / pull.
 // Plain ESM, no JSX: UI is built with jsx()/jsxs() from react/jsx-runtime.
 
-import { host, useValue, Button, Textarea } from '@hermes/plugin-sdk'
+import { host, useValue, Button, Textarea, Dialog, DialogContent, DialogHeader, DialogTitle } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useCallback, useEffect, useState } from 'react'
 
@@ -31,6 +31,23 @@ function Row({ children, style }) {
   return jsx('div', { className: 'flex items-center gap-2', style, children })
 }
 
+function DiffBody({ text }) {
+  const lines = (text || '').split('\n')
+  return jsx('pre', {
+    className: 'max-h-[60vh] overflow-auto rounded border p-2 text-xs leading-5',
+    style: { ...MONO, ...STROKE },
+    children: lines.map((line, i) => {
+      const head = line.slice(0, 3)
+      const color = head.startsWith('+++') || head.startsWith('---') ? 'var(--ui-text-tertiary)'
+        : line.startsWith('+') ? 'var(--ui-green)'
+        : line.startsWith('-') ? 'var(--ui-red)'
+        : line.startsWith('@@') ? 'var(--ui-text-tertiary)'
+        : 'var(--ui-text-secondary)'
+      return jsx('div', { style: { color }, children: line || ' ' }, i)
+    })
+  })
+}
+
 function GitPane() {
   const cwd = useValue(host.state.cwd)
   const cwdName = baseName(cwd)
@@ -40,6 +57,7 @@ function GitPane() {
   const [picked, setPicked] = useState([])
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState('')
+  const [diff, setDiff] = useState(null)
 
   const toast = useCallback((message, kind = 'info') => {
     host.notify({ kind, message })
@@ -97,12 +115,25 @@ function GitPane() {
     setMessage('')
     setRepos([])
     setRepo('')
+    setDiff(null)
     if (cwd) void scan(cwd)
   }, [cwd, scan])
 
   const onPick = useCallback((path, on) => {
     setPicked((prev) => (on ? [...new Set([...prev, path])] : prev.filter((p) => p !== path)))
   }, [])
+
+  const openDiff = useCallback(async (path) => {
+    if (!repo) return
+    setDiff({ path, text: '加载中…', truncated: false })
+    try {
+      const d = await api(`/diff?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`
+        + `&cwd=${encodeURIComponent(cwd || repo)}`)
+      setDiff({ path: d.path, text: d.diff, truncated: d.truncated })
+    } catch (err) {
+      setDiff({ path, text: '无法读取 diff: ' + err.message, truncated: false })
+    }
+  }, [repo, cwd])
 
   const run = useCallback(async (kind, path, body, describe, notify = false) => {
     setBusy(kind)
@@ -182,6 +213,7 @@ function GitPane() {
                 onClick: () => {
                   setRepo(r.path)
                   setMessage('')
+                  setDiff(null)
                   refresh(r.path)
                 },
                 className: 'flex w-full items-center gap-1 px-1.5 py-1 text-left text-xs',
@@ -205,16 +237,24 @@ function GitPane() {
         className: 'min-h-0 flex-1 overflow-auto rounded border p-1',
         style: STROKE,
         children: status && status.files.length
-          ? status.files.map((f) => jsxs('label', {
-              className: 'flex cursor-pointer items-center gap-2 px-1 py-0.5 text-xs',
+          ? status.files.map((f) => jsxs('div', {
+              className: 'flex items-center gap-2 px-1 py-0.5 text-xs',
               children: [
                 jsx('input', {
                   type: 'checkbox',
+                  className: 'cursor-pointer',
                   checked: picked.includes(f.path),
                   onChange: (e) => onPick(f.path, e.target.checked)
                 }),
-                jsx('span', { style: { ...MONO, ...MUTED }, children: f.code }),
-                jsx('span', { className: 'truncate', children: f.path })
+                jsx('span', {
+                  className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
+                  title: '点击查看 diff',
+                  onClick: () => void openDiff(f.path),
+                  children: [
+                    jsx('span', { style: { ...MONO, ...MUTED }, children: f.code }),
+                    jsx('span', { className: 'truncate', children: f.path })
+                  ]
+                })
               ]
             }, f.path + f.code))
           : jsx('div', { className: 'p-1 text-xs', style: MUTED,
@@ -240,6 +280,29 @@ function GitPane() {
         jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full', disabled, onClick: doPull,
           children: busy === 'pull' ? '拉取中…' : '拉取' })
       ] }),
+      jsx(Dialog, {
+        open: Boolean(diff),
+        onOpenChange: (open) => { if (!open) setDiff(null) },
+        children: jsx(DialogContent, {
+          className: 'max-w-3xl',
+          children: jsxs('div', {
+            className: 'flex flex-col gap-2',
+            children: [
+              jsx(DialogHeader, {
+                children: jsx(DialogTitle, {
+                  className: 'truncate text-sm',
+                  style: MONO,
+                  children: diff ? diff.path : ''
+                })
+              }),
+              jsx(DiffBody, { text: diff ? diff.text : '' }),
+              diff && diff.truncated
+                ? jsx('div', { className: 'text-xs', style: MUTED, children: 'diff 已截断' })
+                : null
+            ]
+          })
+        })
+      })
     ]
   })
 }

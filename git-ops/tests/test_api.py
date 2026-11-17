@@ -58,6 +58,16 @@ def main() -> int:
         check("GET /status branch", r["ok"] and r["data"]["branch"] == "main", r)
 
         fx.write(fx.work, "api.txt", "x\n")
+        r = client.get("/api/plugins/git-ops/diff",
+                       params={"repo": ".", "path": "api.txt", "cwd": work}).json()
+        check("GET /diff (new file)", r.get("ok") and "api.txt" in r["data"]["diff"], r)
+
+        (fx.work / "readme.txt").write_text("hello\nchanged\n", encoding="utf-8")
+        r = client.get("/api/plugins/git-ops/diff",
+                       params={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+        check("GET /diff (tracked) has +++ b/ header",
+              r.get("ok") and "+++ b/readme.txt" in r["data"]["diff"], r)
+
         r = client.post("/api/plugins/git-ops/commit-info",
                         json={"repo": ".", "paths": ["api.txt"], "cwd": work}).json()
         check("POST /commit-info", r.get("ok") and r["data"]["header"], r)
