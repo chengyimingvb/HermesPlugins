@@ -129,11 +129,11 @@ function FileList({ files, picked, onPick, onOpen }) {
         }),
         jsx('span', {
           className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
-          title: '点击用 TortoiseGit 查看 diff（不可用时内置视图）',
+          title: `${f.path} · 点击查看 diff`,
           onClick: () => void onOpen(f.path),
           children: [
             jsx('span', { style: { ...MONO, ...(stColor ? { color: stColor } : MUTED) }, children: f.code }),
-            jsx('span', { className: 'truncate font-medium', style: stStyle, children: f.path })
+            jsx('span', { className: 'truncate font-medium', style: stStyle, children: f.path.split('/').pop() })
           ]
         })
       ]
@@ -383,7 +383,8 @@ function GitPane() {
     setFileBusy(true)
     try {
       const data = await api(`/files?repo=${enc(target)}&cwd=${enc(base || target)}`)
-      const paths = (data.files || []).sort()
+      // Drop Unity .meta companion files from the search index.
+      const paths = (data.files || []).filter((p) => !p.toLowerCase().endsWith('.meta')).sort()
       fileCache.current.set(target, paths)
       setFileList(paths)
     } catch (err) {
