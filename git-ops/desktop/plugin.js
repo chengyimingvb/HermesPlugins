@@ -352,6 +352,12 @@ function GitPane() {
     try {
       const st = await api(`/status?repo=${enc(target)}&cwd=${enc(at || target)}`)
       setStatus(st)
+      // The repo row carries its own copy of branch/ahead/behind/dirty (scan builds it); a
+      // commit or push changes them without a re-scan, so fold the fresh status back in.
+      setRepos((prev) => prev.map((r) => (normPath(r.path) === normPath(st.path)
+        ? { ...r, branch: st.branch, upstream: st.upstream, ahead: st.ahead,
+            behind: st.behind, dirty: (st.files || []).length }
+        : r)))
       const paths = st.files.map((f) => f.path)
       setPicked((prev) => (resetPicked ? paths : prev.filter((p) => paths.includes(p))))
       return st
