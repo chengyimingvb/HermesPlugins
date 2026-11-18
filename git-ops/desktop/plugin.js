@@ -159,9 +159,17 @@ function FileList({ files, picked, onPick, onOpen }) {
 
 // Windowed the same way FileList does: past VIRTUAL_AFTER entries, only the visible
 // window sits in the DOM, driven by scroll position.
-function SearchList({ files }) {
+//
+// Two render modes, switched by whether a filter is active:
+//   * filterActive (关键词/后缀非空) → flat filtered list (existing behaviour).
+//   * otherwise → repo file tree; all dirs start collapsed, a click expands
+//     that level one step, while a file row copies its path.
+function SearchList({ all, files, filterActive }) {
   const ref = useRef(null)
   const [view, setView] = useState({ top: 0, height: 320 })
+  // null = "user hasn't expanded anything yet" → all dirs start collapsed;
+  // the first toggle materialises a concrete Set and keeps its state from then on.
+  const [expanded, setExpanded] = useState(null)
   useEffect(() => {
     const el = ref.current
     if (!el || typeof ResizeObserver === 'undefined') return undefined
@@ -169,17 +177,65 @@ function SearchList({ files }) {
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
-  const total = files.length
+  // Build the prefix tree once per repo list; rebuild only when the list or mode changes.
+  const tree = useMemo(() => {
+    if (filterActive) return null
+    const root = { name: '', path: '', isDir: true, children: new Map() }
+    for (const p of all) {
+      const parts = p.split('/')
+      let node = root
+      parts.forEach((seg, i) => {
+        const last = i === parts.length - 1
+        let child = node.children.get(seg)
+        if (!child) {
+          child = { name: seg, path: parts.slice(0, i + 1).join('/'), isDir: !last, children: last ? null : new Map() }
+          node.children.set(seg, child)
+        }
+        node = child
+      })
+    }
+    return root
+  }, [all, filterActive])
+  const open = useMemo(() => (expanded === null ? new Set() : expanded), [expanded])
+  const toggle = useCallback((path) => {
+    setExpanded((prev) => {
+      const cur = new Set(prev === null ? new Set() : prev)
+      if (cur.has(path)) cur.delete(path); else cur.add(path)
+      return cur
+    })
+  }, [])
+  // Unified windowed item list: directory rows (expandable) or flat filtered paths.
+  const items = useMemo(() => {
+    if (filterActive) {
+      return files.map((p) => ({ path: p, name: p.split('/').pop(), depth: 0, isDir: false }))
+    }
+    if (!tree) return []
+    const rows = []
+    const walk = (node, depth) => {
+      for (const child of node.children.values()) {
+        rows.push({ path: child.path, name: child.name, depth, isDir: child.isDir })
+        if (child.isDir && child.children && open.has(child.path)) walk(child, depth + 1)
+      }
+    }
+    walk(tree, 0)
+    return rows
+  }, [filterActive, files, tree, open])
+  const total = items.length
   const virtual = total > VIRTUAL_AFTER
   const start = virtual ? Math.max(0, Math.floor(view.top / ROW) - 6) : 0
   const end = virtual ? Math.min(total, Math.ceil((view.top + view.height) / ROW) + 6) : total
-  const renderRow = (path) => jsx('div', {
+  const renderRow = (it) => jsxs('div', {
     className: 'flex min-w-0 cursor-pointer items-center gap-1 rounded px-1 text-xs hover:bg-[var(--ui-row-active-background)]',
-    style: { height: ROW },
-    title: path,
-    onClick: () => copyPath(path),
-    children: jsx('span', { className: 'min-w-0 flex-1 truncate', style: MONO, children: baseName(path) })
-  }, path)
+    style: { height: ROW, paddingLeft: 4 + it.depth * 12 },
+    title: it.path,
+    onClick: () => (it.isDir ? toggle(it.path) : copyPath(it.path)),
+    children: [
+      it.isDir
+        ? jsx('span', { className: 'shrink-0 w-3 text-center', style: MUTED, children: open.has(it.path) ? '▾' : '▸' })
+        : jsx('span', { className: 'shrink-0 w-3' }),
+      jsx('span', { className: 'min-w-0 flex-1 truncate', style: it.isDir ? undefined : MONO, children: it.name })
+    ]
+  }, it.path)
   return jsx('div', {
     ref,
     // Read scrollTop into a local BEFORE setView: React nulls e.currentTarget once the
@@ -193,10 +249,10 @@ function SearchList({ files }) {
           style: virtual ? { position: 'relative', height: total * ROW } : undefined,
           children: jsx('div', {
             style: virtual ? { position: 'absolute', top: start * ROW, left: 0, right: 0 } : undefined,
-            children: files.slice(start, end).map(renderRow)
+            children: items.slice(start, end).map(renderRow)
           })
         })
-      : jsx('div', { className: 'p-1', style: MUTED, children: '没有匹配的文件' })
+      : jsx('div', { className: 'p-1', style: MUTED, children: filterActive ? '没有匹配的文件' : '(空仓库)' })
   })
 }
 
@@ -512,7 +568,11 @@ function GitPane() {
                 children: '清除'
               })
             ] }),
-            jsx(SearchList, { files: visibleFiles })
+            jsx(SearchList, {
+              all: fileList,
+              files: visibleFiles,
+              filterActive: Boolean(searchTerm || searchSuffix)
+            })
           ] })
         : null,
       jsx('div', {
@@ -644,6 +704,7 @@ export default {
   id: 'git-ops',
   name: 'Git Ops',
   register(ctx) {
+
     rest = ctx.rest
     ctx.register({
       id: 'pane',
@@ -655,3 +716,4 @@ export default {
     })
   }
 }
+
