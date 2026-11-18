@@ -387,6 +387,95 @@ class GitOpsTests(unittest.TestCase):
         self.assertTrue(commits["commits"][0]["subject"].startswith("feat: 增加 prof"))
         self.assertTrue(commits["commits"][0]["sha"])
 
+    def test_mutating_tool_emits_change_event(self):
+        """commit/push/pull/discard 成功后要往会话事件流推 plugin.git-ops.<kind>。"""
+        import json
+        plugin = load_plugin()
+        work = str(self.fx.work)
+        events, calls = [], {}
+
+        class FakeCtx:
+            llm = FakeLlm()
+
+            def session_cwd(self):
+                return work
+
+            def register_tool(self, **kwargs):
+                calls[kwargs["name"]] = kwargs
+
+            def emit_to_session(self, session_id, event, payload=None):
+                events.append((session_id, event, payload))
+                return True
+
+        plugin.register(FakeCtx())
+        saved = os.environ.get("HERMES_SESSION_ID")
+        os.environ["HERMES_SESSION_ID"] = "session-under-test"
+        try:
+            self.fx.write(self.fx.work, "ev.txt", "e\n")
+            answer = json.loads(calls["git_commit"]["handler"](
+                {"repo": work, "paths": ["ev.txt"], "message": "feat: 增加 ev 文件"}))
+            self.assertTrue(answer["ok"], answer)
+            self.assertEqual(len(events), 1, events)
+            session_id, event, payload = events[0]
+            self.assertEqual(session_id, "session-under-test")
+            self.assertEqual(event, "commit")
+            self.assertEqual(payload["kind"], "commit")
+            self.assertEqual(payload["repo"], gitops.resolve_repo(work, work))
+            self.assertEqual(payload["sha"], answer["data"]["sha"])
+            # A failed call must stay silent, or the pane refreshes on nothing. An untracked
+            # path is the cheapest real refusal; ev.txt stays committed (no dirty work tree
+            # left behind for the tests that share this fixture).
+            events.clear()
+            self.fx.write(self.fx.work, "ev-untracked.txt", "u\n")
+            failed = json.loads(calls["git_discard"]["handler"](
+                {"repo": work, "paths": ["ev-untracked.txt"]}))
+            self.assertFalse(failed["ok"], failed)
+            self.assertEqual(events, [])
+            os.remove(self.fx.work / "ev-untracked.txt")
+        finally:
+            if saved is None:
+                os.environ.pop("HERMES_SESSION_ID", None)
+            else:
+                os.environ["HERMES_SESSION_ID"] = saved
+
+    def test_change_event_falls_back_to_broadcast(self):
+        """会话门不通（isolation: host 无 session id）时退化成全局广播，面板照样刷新。"""
+        import json
+        plugin = load_plugin()
+        work = str(self.fx.work)
+        events, calls, broadcasts = [], {}, []
+        original = getattr(plugin, "_broadcast")
+        setattr(plugin, "_broadcast", lambda kind, payload: broadcasts.append((kind, payload)))
+
+        class FakeCtx:
+            llm = FakeLlm()
+
+            def session_cwd(self):
+                return work
+
+            def register_tool(self, **kwargs):
+                calls[kwargs["name"]] = kwargs
+
+            def emit_to_session(self, session_id, event, payload=None):
+                events.append((session_id, event, payload))
+                return False  # no live viewer on that session stream
+
+        saved = os.environ.pop("HERMES_SESSION_ID", None)
+        try:
+            plugin.register(FakeCtx())
+            self.fx.write(self.fx.work, "bc.txt", "b\n")
+            answer = json.loads(calls["git_commit"]["handler"](
+                {"repo": work, "paths": ["bc.txt"], "message": "feat: 增加 bc 文件"}))
+            self.assertTrue(answer["ok"], answer)
+            self.assertEqual(events, [], "no session id -> the session door is skipped")
+            self.assertEqual(len(broadcasts), 1, broadcasts)
+            self.assertEqual(broadcasts[0][0], "commit")
+            self.assertEqual(broadcasts[0][1]["repo"], gitops.resolve_repo(work, work))
+        finally:
+            setattr(plugin, "_broadcast", original)
+            if saved is not None:
+                os.environ["HERMES_SESSION_ID"] = saved
+
     def test_discard(self):
         self.fx.write(self.fx.work, "keep.txt", "v1\n")
         gitops.commit(".", ["keep.txt"], "feat: 增加 keep 文件", str(self.fx.work))

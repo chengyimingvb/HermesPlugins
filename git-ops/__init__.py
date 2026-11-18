@@ -6,11 +6,76 @@ root including submodules; commit/push/pull/discard act on exactly the repo you 
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 
 from . import gitops
 
 logger = logging.getLogger(__name__)
+
+# ── change notifications ─────────────────────────────────────────────────
+# The desktop pane acts on one repo at a time and polls its status with a backoff. An
+# agent-side commit/push/pull/discard would otherwise sit unseen until that poll came
+# round. Every mutating tool therefore pushes ``plugin.git-ops.<kind>`` onto the running
+# session's event stream (``ctx.emit_to_session``); the pane subscribes with
+# ``ctx.onEvent`` and refreshes at once. Fire-and-forget: no viewer, no authority or a
+# dead socket is never a tool failure.
+
+_EVENT_KEYS = ("sha", "short", "header", "branch", "upstream", "pulled", "status", "scanned")
+
+
+def _session_id() -> str:
+    """The runtime session id of the turn this tool call runs in, ``""`` outside one."""
+    try:
+        from gateway.session_context import get_session_env
+        found = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:  # no gateway process (tests, CLI one-shot): env is the fallback
+        found = ""
+    return found or os.environ.get("HERMES_SESSION_ID", "")
+
+
+def _notify(ctx, kind: str, data: dict) -> None:
+    """Tell the session's viewers that one repo changed. Never raises."""
+    payload = {"kind": kind, "repo": str(data.get("path") or "")}
+    for key in _EVENT_KEYS:
+        if data.get(key) is not None:
+            payload[key] = data[key]
+    session_id = _session_id()
+    delivered = False
+    if session_id:
+        try:
+            delivered = bool(ctx.emit_to_session(session_id, kind, payload))
+        except Exception as exc:  # noqa: BLE001 - a lost frame is not a failed commit
+            logger.debug("git-ops: %s event not delivered: %s", kind, exc)
+    if not delivered:
+        _broadcast(kind, payload)
+
+
+def _broadcast(kind: str, payload: dict) -> None:
+    """Fallback when the session door is unavailable: ``plugins.isolation: host`` leaves the
+    plugin process without the turn's session id, and a call outside a desktop session has no
+    stream to land on. Fanning out to every connected window is then the only way the pane
+    hears about it; the pane itself drops frames for another repo."""
+    try:
+        from hermes_cli.plugin_events import broadcast_plugin_event
+        broadcast_plugin_event("git-ops", kind, payload)
+    except Exception as exc:  # noqa: BLE001 - no gateway in this process (tests, CLI tooling)
+        logger.debug("git-ops: %s broadcast not delivered: %s", kind, exc)
+
+
+def _notifying(ctx, kind: str, fn, *args, **kwargs) -> str:
+    """``envelope`` for one mutating call, plus the change event when it succeeded."""
+    text = gitops.envelope(fn, *args, **kwargs)
+    try:
+        answer = json.loads(text)
+    except ValueError:
+        return text
+    if answer.get("ok"):
+        data = answer.get("data")
+        _notify(ctx, kind, data if isinstance(data, dict) else {})
+    return text
+
 
 _REPO = {"type": "string",
          "description": "Repo: absolute path, path relative to the session cwd, or a short name "
@@ -138,22 +203,22 @@ def register(ctx) -> None:
                                args.get("paths") or [], cwd(), ctx.llm)
 
     def h_commit(args, **_kw):
-        return gitops.envelope(gitops.auto_commit, args.get("repo") or ".", args.get("paths") or [],
-                               args.get("message") or "", cwd(), ctx.llm)
+        return _notifying(ctx, "commit", gitops.auto_commit, args.get("repo") or ".",
+                          args.get("paths") or [], args.get("message") or "", cwd(), ctx.llm)
 
     def h_push(args, **_kw):
-        return gitops.envelope(gitops.push, args.get("repo") or ".", cwd())
+        return _notifying(ctx, "push", gitops.push, args.get("repo") or ".", cwd())
 
     def h_pull(args, **_kw):
         mode = args.get("mode") or "ff"
         submodules = bool(args.get("submodules", True))
         if args.get("roots"):
-            return gitops.envelope(gitops.pull_many, args["roots"], cwd(), mode, submodules)
-        return gitops.envelope(gitops.pull, args.get("repo") or ".", cwd(), mode, submodules)
+            return _notifying(ctx, "pull", gitops.pull_many, args["roots"], cwd(), mode, submodules)
+        return _notifying(ctx, "pull", gitops.pull, args.get("repo") or ".", cwd(), mode, submodules)
 
     def h_discard(args, **_kw):
-        return gitops.envelope(gitops.discard, args.get("repo") or ".",
-                               args.get("paths") or [], cwd())
+        return _notifying(ctx, "discard", gitops.discard, args.get("repo") or ".",
+                          args.get("paths") or [], cwd())
 
     handlers = {"git_repos": h_repos, "git_status": h_status, "git_diff": h_diff,
                 "git_log": h_log, "git_commit_info": h_info, "git_commit": h_commit,

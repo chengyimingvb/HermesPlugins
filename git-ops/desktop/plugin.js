@@ -1,11 +1,20 @@
 // git-ops desktop half — repo discovery, status, generated commit message, commit / push / pull / discard.
 // Plain ESM, no JSX: UI is built with jsx()/jsxs() from react/jsx-runtime.
 
-import { host, useValue, Button, Textarea, Dialog, DialogContent, DialogHeader, DialogTitle } from '@hermes/plugin-sdk'
+import { atom, host, useValue, Button, Textarea, Dialog, DialogContent, DialogHeader, DialogTitle } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 let rest = null
+
+const ID = 'git-ops'
+// The backend emits one of these after every mutating tool call (commit / push / pull /
+// discard), so the pane refreshes on the change instead of waiting out its poll backoff.
+const GIT_EVENTS = ['commit', 'push', 'pull', 'discard']
+// Last change this session was told about; the pane reads it with useValue and refreshes
+// when the count moves. `repo` is the resolved work-tree root the backend acted on.
+const $gitChange = atom({ seq: 0, kind: '', repo: '' })
+const normPath = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 
 const GET_TIMEOUT = 120000
 const POST_TIMEOUT = 180000
@@ -479,6 +488,18 @@ function GitPane() {
     return () => { cancelled = true; if (timer) clearTimeout(timer) }
   }, [repo, base, busy, refresh])
 
+  // Event-driven refresh: the agent's own git_commit / git_push / git_pull / git_discard
+  // tool calls push plugin.git-ops.<kind> to this session. Only the seq matters — an event
+  // for another repo (or from another session, which ctx.onEvent already filtered) is
+  // skipped, and a replayed frame from a reconnect never fires here.
+  const change = useValue($gitChange)
+  useEffect(() => {
+    if (!change.seq || !repo) return
+    if (change.repo && normPath(change.repo) !== normPath(repo)) return
+    // keep the user's selection across the refresh, exactly like the poll does
+    void refresh(repo, base)
+  }, [change.seq, change.repo, repo, base, refresh])
+
   const onPick = useCallback((path, on) => {
     // Avoid the double array copy + Set build on the hot path: an include-guard is enough.
     setPicked((prev) => (on ? (prev.includes(path) ? prev : [...prev, path]) : prev.filter((p) => p !== path)))
@@ -775,11 +796,25 @@ function GitPane() {
 }
 
 export default {
-  id: 'git-ops',
+  id: ID,
   name: 'Git Ops',
   register(ctx) {
 
     rest = ctx.rest
+
+    // ctx.onEvent (not host.onEvent): the loader disposes these on reload/disable, so a
+    // module swap cannot stack duplicate listeners. Replayed frames are old turns —
+    // refreshing from them would undo nothing but wastes a status call, so drop them.
+    const on = typeof ctx.onEvent === 'function' ? ctx.onEvent.bind(ctx) : host.onEvent.bind(host)
+    for (const kind of GIT_EVENTS) {
+      on(`plugin.${ID}.${kind}`, (event) => {
+        if (!event || event.replayed) return
+        const payload = event.payload || {}
+        const prev = $gitChange.get()
+        $gitChange.set({ seq: prev.seq + 1, kind, repo: payload.repo || '' })
+      })
+    }
+
     ctx.register({
       id: 'pane',
       area: 'panes',
