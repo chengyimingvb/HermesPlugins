@@ -617,6 +617,8 @@ function GitPane() {
             })
           ] })
         : null,
+        // Hairline dividing the File module (search) from the Git module below.
+        jsx('div', { className: 'h-px shrink-0', style: { background: 'var(--ui-stroke-secondary)' } }),
       jsx('div', {
         className: 'max-h-28 shrink-0 overflow-auto rounded border',
         style: { ...STROKE, background: 'var(--ui-bg-tertiary)' },
