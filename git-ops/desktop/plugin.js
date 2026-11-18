@@ -78,6 +78,30 @@ function baseName(full) {
   return trimmed.split(/[\\/]/).pop() || ''
 }
 
+// Small inline SVGs for the tree. currentColor keeps them theme-aware; the two slots
+// share a fixed width so folder and file NAMES align at every depth.
+function FolderIcon() {
+  return jsx('svg', {
+    className: 'shrink-0', viewBox: '0 0 16 16', width: 14, height: 14,
+    fill: 'none', 'aria-hidden': true, style: { color: 'var(--ui-text-secondary)' },
+    children: jsx('path', {
+      d: 'M1.5 4.5A1.5 1.5 0 0 1 3 3h2.9l1.5 1.5H13a1.5 1.5 0 0 1 1.5 1.5v5.5A1.5 1.5 0 0 1 13 13H3a1.5 1.5 0 0 1-1.5-1.5V4.5Z',
+      stroke: 'currentColor', strokeWidth: 1.3, strokeLinejoin: 'round'
+    })
+  })
+}
+
+function FileIcon() {
+  return jsx('svg', {
+    className: 'shrink-0', viewBox: '0 0 16 16', width: 14, height: 14,
+    fill: 'none', 'aria-hidden': true, style: { color: 'var(--ui-text-tertiary)' },
+    children: jsx('path', {
+      d: 'M5 1.5h3.7L12 4.8V13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V2.5A1 1 0 0 1 5 1.5Z',
+      stroke: 'currentColor', strokeWidth: 1.2, strokeLinejoin: 'round'
+    })
+  })
+}
+
 function Row({ children, style }) {
   return jsx('div', { className: 'flex items-center gap-2', style, children })
 }
@@ -212,7 +236,11 @@ function SearchList({ all, files, filterActive }) {
     if (!tree) return []
     const rows = []
     const walk = (node, depth) => {
-      for (const child of node.children.values()) {
+      // Folders first, then files; alphabetical within each group.
+      const kids = [...node.children.values()].sort((a, b) =>
+        a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1
+      )
+      for (const child of kids) {
         rows.push({ path: child.path, name: child.name, depth, isDir: child.isDir })
         if (child.isDir && child.children && open.has(child.path)) walk(child, depth + 1)
       }
@@ -224,18 +252,31 @@ function SearchList({ all, files, filterActive }) {
   const virtual = total > VIRTUAL_AFTER
   const start = virtual ? Math.max(0, Math.floor(view.top / ROW) - 6) : 0
   const end = virtual ? Math.min(total, Math.ceil((view.top + view.height) / ROW) + 6) : total
-  const renderRow = (it) => jsxs('div', {
-    className: 'flex min-w-0 cursor-pointer items-center gap-1 rounded px-1 text-xs hover:bg-[var(--ui-row-active-background)]',
-    style: { height: ROW, paddingLeft: 4 + it.depth * 12 },
-    title: it.path,
-    onClick: () => (it.isDir ? toggle(it.path) : copyPath(it.path)),
-    children: [
-      it.isDir
-        ? jsx('span', { className: 'shrink-0 w-3 text-center', style: MUTED, children: open.has(it.path) ? '▾' : '▸' })
-        : jsx('span', { className: 'shrink-0 w-3' }),
-      jsx('span', { className: 'min-w-0 flex-1 truncate', style: it.isDir ? undefined : MONO, children: it.name })
-    ]
-  }, it.path)
+  const renderRow = (it) => {
+    const isOpen = it.isDir && open.has(it.path)
+    return jsxs('div', {
+      className: 'flex min-w-0 cursor-pointer items-center gap-2 rounded px-1 text-xs hover:bg-[var(--ui-row-active-background)]',
+      style: { height: ROW, paddingLeft: 4 + it.depth * 12 },
+      title: it.path,
+      onClick: () => (it.isDir ? toggle(it.path) : copyPath(it.path)),
+      children: [
+        it.isDir
+          ? jsx('svg', {
+              className: 'shrink-0 text-[var(--ui-text-tertiary)] transition-transform duration-150',
+              style: { transform: isOpen ? 'rotate(90deg)' : 'rotate(0deg)', width: 14, height: 14 },
+              viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true,
+              children: jsx('path', { d: 'M6 4l4 4-4 4', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' })
+            })
+          : jsx('span', { className: 'shrink-0', style: { width: 14 } }),
+        it.isDir ? jsx(FolderIcon, {}) : jsx(FileIcon, {}),
+        jsx('span', {
+          className: 'min-w-0 flex-1 truncate font-medium',
+          style: it.isDir ? undefined : MUTED,
+          children: it.name
+        })
+      ]
+    }, it.path)
+  }
   return jsx('div', {
     ref,
     // Read scrollTop into a local BEFORE setView: React nulls e.currentTarget once the
