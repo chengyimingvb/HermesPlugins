@@ -150,11 +150,76 @@ def _tgit_exe() -> str:
     raise gitops.GitOpsError("TortoiseGit not installed (TortoiseGitProc.exe not found)")
 
 
+def _raise_window_to_front(pid: int, timeout: float = 2.0) -> None:
+    """Bring the spawned process's main window over Hermes once it appears.
+
+    A DETACHED child builds its window in the background, so Hermes keeps the
+    foreground and the diff opens behind it. While polling for the window we
+    (a) attach to Hermes's foreground thread so SetForegroundWindow is allowed,
+    (b) raise the window past every normal-height window via topmost-then-restore.
+    """
+    import ctypes
+    import time
+
+    import win32api
+    import win32con
+    import win32gui
+    import win32process
+
+    user32 = ctypes.windll.user32
+
+    def _attach_input(src: int, dst: int, on: bool) -> bool:
+        # AttachThreadInput is a User32 call pywin32 does not expose; route via ctypes.
+        user32.AttachThreadInput.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_bool]
+        user32.AttachThreadInput.restype = ctypes.c_bool
+        return bool(user32.AttachThreadInput(src, dst, on))
+
+    pid = int(pid)
+    window = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found = []
+
+        def _windows(hwnd, _data):
+            _t, wpid = win32process.GetWindowThreadProcessId(hwnd)
+            if wpid == pid and win32gui.IsWindowVisible(hwnd):
+                found.append(hwnd)
+            return True
+
+        win32gui.EnumWindows(_windows, None)
+        if found:
+            window = found[0]
+            break
+        time.sleep(0.05)
+    if not window:
+        return
+
+    cur = win32api.GetCurrentThreadId()
+    fg = win32gui.GetForegroundWindow()
+    fg_thread = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
+    attached = False
+    if fg_thread and fg_thread != cur:
+        attached = _attach_input(cur, fg_thread, True)
+    try:
+        win32gui.SetForegroundWindow(window)
+        win32gui.SetWindowPos(window, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW)
+        win32gui.SetWindowPos(window, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+    finally:
+        if attached:
+            _attach_input(cur, fg_thread, False)
+
+
 def _spawn_tgit_diff(exe: str, target: str) -> None:
     """Fire and forget: TortoiseGitProc owns its window and returns at once."""
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    subprocess.Popen([exe, "/command:diff", f"/path:{target}", "/closeonend:0"],
-                     close_fds=True, creationflags=flags)
+    proc = subprocess.Popen([exe, "/command:diff", f"/path:{target}", "/closeonend:0"],
+                            close_fds=True, creationflags=flags)
+    # Ensure the freshly opened window surfaces above Hermes (Windows-only path).
+    pid = getattr(proc, "pid", None)
+    if pid:
+        _raise_window_to_front(pid)
 
 
 def launch_tgit_diff(repo: str, path: str, cwd: str) -> dict[str, Any]:

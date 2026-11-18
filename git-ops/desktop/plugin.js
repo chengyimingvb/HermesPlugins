@@ -27,6 +27,24 @@ const MUTED = { color: 'var(--ui-text-tertiary)' }
 const STROKE = { borderColor: 'var(--ui-stroke-secondary)' }
 const MONO = { fontFamily: 'var(--font-mono, ui-monospace)' }
 
+// Workspace rows get a status-driven text color from the porcelain-v2 XY code
+// backend sends (X=index, Y=worktree; whole tokens ?? untracked, !! ignored).
+// Checked by severity so a rename-with-edit or staged-delete reads as the more
+// destructive status, not the more recent edit.
+function codeColor(code) {
+  const c = code || ''
+  if (c[0] === 'U' || c[1] === 'U') return 'var(--ui-danger)'    // conflict / unmerged
+  if (c === '??') return 'var(--ui-cyan)'                          // untracked
+  if (c === '!!') return undefined                                 // ignored → default muted
+  if (c[0] === 'D' || c[1] === 'D') return 'var(--ui-red)'         // deleted
+  if (c[0] === 'R' || c[1] === 'R') return 'var(--ui-blue)'        // renamed
+  if (c[0] === 'C' || c[1] === 'C') return 'var(--ui-blue)'        // copied
+  if (c[0] === 'A' || c[1] === 'A') return 'var(--ui-green)'       // added
+  if (c[0] === 'T' || c[1] === 'T') return 'var(--ui-orange)'      // type changed
+  if (c[0] === 'M' || c[1] === 'M') return 'var(--ui-yellow)'      // modified
+  return undefined
+}
+
 // Display only the workspace's own folder name; the full path stays in the tooltip.
 function baseName(full) {
   const trimmed = (full || '').replace(/[\\/]+$/, '')
@@ -69,27 +87,31 @@ function FileList({ files, picked, onPick, onOpen }) {
   const virtual = total > VIRTUAL_AFTER
   const start = virtual ? Math.max(0, Math.floor(view.top / ROW) - 6) : 0
   const end = virtual ? Math.min(total, Math.ceil((view.top + view.height) / ROW) + 6) : total
-  const renderRow = (f) => jsxs('div', {
-    className: 'flex items-center gap-2 px-1 text-xs',
-    style: { height: ROW },
-    children: [
-      jsx('input', {
-        type: 'checkbox',
-        className: 'cursor-pointer',
-        checked: picked.includes(f.path),
-        onChange: (e) => onPick(f.path, e.target.checked)
-      }),
-      jsx('span', {
-        className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
-        title: '点击用 TortoiseGit 查看 diff（不可用时内置视图）',
-        onClick: () => void onOpen(f.path),
-        children: [
-          jsx('span', { style: { ...MONO, ...MUTED }, children: f.code }),
-          jsx('span', { className: 'truncate', children: f.path })
-        ]
-      })
-    ]
-  }, f.path + f.code)
+  const renderRow = (f) => {
+    const stColor = codeColor(f.code)
+    const stStyle = stColor ? { color: stColor } : undefined
+    return jsxs('div', {
+      className: 'flex items-center gap-2 px-1 text-xs',
+      style: { height: ROW },
+      children: [
+        jsx('input', {
+          type: 'checkbox',
+          className: 'cursor-pointer',
+          checked: picked.includes(f.path),
+          onChange: (e) => onPick(f.path, e.target.checked)
+        }),
+        jsx('span', {
+          className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
+          title: '点击用 TortoiseGit 查看 diff（不可用时内置视图）',
+          onClick: () => void onOpen(f.path),
+          children: [
+            jsx('span', { style: { ...MONO, ...(stColor ? { color: stColor } : MUTED) }, children: f.code }),
+            jsx('span', { className: 'truncate font-medium', style: stStyle, children: f.path })
+          ]
+        })
+      ]
+    }, f.path + f.code)
+  }
   return jsx('div', {
     ref,
     onScroll: (e) => { if (virtual) setView((v) => ({ ...v, top: e.currentTarget.scrollTop })) },
@@ -124,7 +146,6 @@ function GitPane() {
   // Workspace of the focused chat (falls back to the window cwd) — what the pane acts on.
   const [workspace, setWorkspace] = useState('')
   const base = workspace || cwd
-  const cwdName = baseName(base)
 
   const toast = useCallback((text, kind = 'info') => {
     host.notify({ kind, message: text })
@@ -183,12 +204,7 @@ function GitPane() {
 
   useEffect(() => {
     let cancelled = false
-    setStatus(null)
-    setPicked([])
     setMessage('')
-    setRepos([])
-    setRepo('')
-    setDiff(null)
     void (async () => {
       let target = cwd
       if (sessionKey) {
@@ -207,11 +223,22 @@ function GitPane() {
         }
       }
       if (cancelled) return
+      // Same project (same resolved cwd) as already shown: keep the pane's data —
+      // switching between sessions in one workspace must not force a re-scan.
+      if (target === base && repos.length) {
+        setWorkspace(target)
+        return
+      }
+      setStatus(null)
+      setPicked([])
+      setRepos([])
+      setRepo('')
+      setDiff(null)
       setWorkspace(target || '')
       if (target) await scan(target)
     })()
     return () => { cancelled = true }
-  }, [cwd, sessionKey, sessionId, scan])
+  }, [cwd, sessionKey, sessionId, scan, base, repos.length])
 
   // The agent commits in the same repo from its own tool calls; without a poll the pane
   // would keep showing a stale file list until the user hit 刷新.
@@ -267,7 +294,7 @@ function GitPane() {
   const generate = useCallback(async () => {
     if (!repo) return
     const data = await run('info', '/commit-info', { repo, paths: picked, cwd: base },
-      (d) => `生成 ${d.header}${d.truncated ? ' (diff 已截断)' : ''}`, true)
+      (d) => `生成 ${d.header}${d.truncated ? ' (diff 已截断)' : ''}`)
     if (data) setMessage(data.message)
   }, [repo, picked, base, run])
 
@@ -317,12 +344,7 @@ function GitPane() {
     children: [
       jsxs(Row, {
         children: [
-          jsx('div', {
-            className: 'h-7 flex-1 truncate rounded border px-2 py-1 text-xs',
-            style: { ...STROKE, ...MONO, color: 'var(--ui-text-secondary)' },
-            title: base || '',
-            children: cwdName || '(无激活工作区)'
-          }),
+          jsx('span', { className: 'flex-1 text-xs', style: MUTED, children: '仓库' }),
           jsx(Button, {
             size: 'sm', variant: 'secondary',
             onClick: () => scan(base),
