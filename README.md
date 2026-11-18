@@ -1,11 +1,12 @@
 # HermesPlugins
 
-Hermes 桌面端（Electron）插件集合。全部为纯前端 ESM，无构建步骤，不改 Hermes 核心代码，禁用即完全恢复原状。
+Hermes 桌面端（Electron）插件集合。纯前端 ESM 部分无构建步骤，不改 Hermes 核心代码，禁用即完全恢复原状。
 
 | 插件 | 作用 |
 |---|---|
 | [`turn-indicator`](./turn-indicator) | 输入框上方常驻一行「本轮在干什么」：脉冲 + 实时文案 + 秒数；`::turn{}` 内联指令；运行中显示工具行 |
 | [`read-only-mode`](./read-only-mode) | 输入框 `+` 右侧的只读开关（对应 Cursor 的 Ask 模式），开启后每条消息带只读约束 |
+| [`git-ops`](./git-ops) | 右侧 Git 面板 + 9 个 agent 工具：多仓库扫描、状态 / diff / log、生成提交信息、按显式路径提交、推送验证、拉取、放弃修改（含 `dashboard/plugin_api.py` 后端） |
 
 ## 安装
 

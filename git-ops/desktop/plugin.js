@@ -1,21 +1,28 @@
-// git-ops desktop half — repo discovery, status, generated commit message, commit / push / pull.
+// git-ops desktop half — repo discovery, status, generated commit message, commit / push / pull / discard.
 // Plain ESM, no JSX: UI is built with jsx()/jsxs() from react/jsx-runtime.
 
 import { host, useValue, Button, Textarea, Dialog, DialogContent, DialogHeader, DialogTitle } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 let rest = null
+
+const GET_TIMEOUT = 120000
+const POST_TIMEOUT = 180000
+const POLL_MS = 5000
+const ROW = 24
+const VIRTUAL_AFTER = 150
 
 async function api(path, body) {
   if (!rest) throw new Error('backend not ready')
   const res = body === undefined
-    ? await rest(path, { method: 'GET', timeoutMs: 120000 })
-    : await rest(path, { method: 'POST', body, timeoutMs: 180000 })
+    ? await rest(path, { method: 'GET', timeoutMs: GET_TIMEOUT })
+    : await rest(path, { method: 'POST', body, timeoutMs: POST_TIMEOUT })
   if (!res || res.ok !== true) throw new Error((res && res.error) || 'request failed')
   return res.data
 }
 
+const enc = encodeURIComponent
 const MUTED = { color: 'var(--ui-text-tertiary)' }
 const STROKE = { borderColor: 'var(--ui-stroke-secondary)' }
 const MONO = { fontFamily: 'var(--font-mono, ui-monospace)' }
@@ -25,7 +32,6 @@ function baseName(full) {
   const trimmed = (full || '').replace(/[\\/]+$/, '')
   return trimmed.split(/[\\/]/).pop() || ''
 }
-
 
 function Row({ children, style }) {
   return jsx('div', { className: 'flex items-center gap-2', style, children })
@@ -37,13 +43,64 @@ function DiffBody({ text }) {
     className: 'max-h-[60vh] overflow-auto rounded border p-2 text-xs leading-5',
     style: { ...MONO, ...STROKE },
     children: lines.map((line, i) => {
-      const head = line.slice(0, 3)
-      const color = head.startsWith('+++') || head.startsWith('---') ? 'var(--ui-text-tertiary)'
+      const color = line.startsWith('+++') || line.startsWith('---') ? 'var(--ui-text-tertiary)'
         : line.startsWith('+') ? 'var(--ui-green)'
         : line.startsWith('-') ? 'var(--ui-red)'
         : line.startsWith('@@') ? 'var(--ui-text-tertiary)'
         : 'var(--ui-text-secondary)'
       return jsx('div', { style: { color }, children: line || ' ' }, i)
+    })
+  })
+}
+
+// Rows are windowed past VIRTUAL_AFTER entries: a repo with thousands of dirty files
+// must not put thousands of checkboxes in the DOM on every status poll.
+function FileList({ files, picked, onPick, onOpen }) {
+  const ref = useRef(null)
+  const [view, setView] = useState({ top: 0, height: 320 })
+  useEffect(() => {
+    const el = ref.current
+    if (!el || typeof ResizeObserver === 'undefined') return undefined
+    const ro = new ResizeObserver(() => setView((v) => ({ ...v, height: el.clientHeight || 320 })))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  const total = files.length
+  const virtual = total > VIRTUAL_AFTER
+  const start = virtual ? Math.max(0, Math.floor(view.top / ROW) - 6) : 0
+  const end = virtual ? Math.min(total, Math.ceil((view.top + view.height) / ROW) + 6) : total
+  const renderRow = (f) => jsxs('div', {
+    className: 'flex items-center gap-2 px-1 text-xs',
+    style: { height: ROW },
+    children: [
+      jsx('input', {
+        type: 'checkbox',
+        className: 'cursor-pointer',
+        checked: picked.includes(f.path),
+        onChange: (e) => onPick(f.path, e.target.checked)
+      }),
+      jsx('span', {
+        className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
+        title: '点击用 TortoiseGit 查看 diff（不可用时内置视图）',
+        onClick: () => void onOpen(f.path),
+        children: [
+          jsx('span', { style: { ...MONO, ...MUTED }, children: f.code }),
+          jsx('span', { className: 'truncate', children: f.path })
+        ]
+      })
+    ]
+  }, f.path + f.code)
+  return jsx('div', {
+    ref,
+    onScroll: (e) => { if (virtual) setView((v) => ({ ...v, top: e.currentTarget.scrollTop })) },
+    className: 'min-h-0 flex-1 overflow-auto rounded border p-1',
+    style: STROKE,
+    children: jsx('div', {
+      style: virtual ? { position: 'relative', height: total * ROW } : undefined,
+      children: jsx('div', {
+        style: virtual ? { position: 'absolute', top: start * ROW, left: 0, right: 0 } : undefined,
+        children: files.slice(start, end).map(renderRow)
+      })
     })
   })
 }
@@ -63,24 +120,30 @@ function GitPane() {
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState('')
   const [diff, setDiff] = useState(null)
+  const [confirmDiscard, setConfirmDiscard] = useState(false)
   // Workspace of the focused chat (falls back to the window cwd) — what the pane acts on.
   const [workspace, setWorkspace] = useState('')
   const base = workspace || cwd
   const cwdName = baseName(base)
 
-  const toast = useCallback((message, kind = 'info') => {
-    host.notify({ kind, message })
+  const toast = useCallback((text, kind = 'info') => {
+    host.notify({ kind, message: text })
   }, [])
 
-  const refresh = useCallback(async (target, base) => {
-    if (!target) return
+  // resetPicked=false keeps the user's selection across the 5s poll and after a commit;
+  // it only resets on a workspace/repo switch.
+  const refresh = useCallback(async (target, at, resetPicked = false) => {
+    if (!target) return null
     try {
-      const st = await api(`/status?repo=${encodeURIComponent(target)}&cwd=${encodeURIComponent(base || target)}`)
+      const st = await api(`/status?repo=${enc(target)}&cwd=${enc(at || target)}`)
       setStatus(st)
-      setPicked(st.files.map((f) => f.path))
+      const paths = st.files.map((f) => f.path)
+      setPicked((prev) => (resetPicked ? paths : prev.filter((p) => paths.includes(p))))
+      return st
     } catch (err) {
       setStatus(null)
       console.warn('[git-ops] status', err.message)
+      return null
     }
   }, [])
 
@@ -90,13 +153,13 @@ function GitPane() {
     if (!target) return
     setBusy('scan')
     try {
-      const base = encodeURIComponent(target)
-      const data = await api(`/repos?roots=${base}&cwd=${base}&depth=6`)
+      const at = enc(target)
+      const data = await api(`/repos?roots=${at}&cwd=${at}&depth=6`)
       let found = data.repos
       if (!found.length) {
         // Workspace is a plain subdirectory: ask which repo owns it.
         try {
-          const st = await api(`/status?repo=${base}&cwd=${base}`)
+          const st = await api(`/status?repo=${at}&cwd=${at}`)
           found = [{ path: st.path, kind: 'main', parent: '', branch: st.branch,
             upstream: st.upstream, ahead: st.ahead, behind: st.behind, dirty: st.files.length }]
         } catch {
@@ -110,7 +173,7 @@ function GitPane() {
         .sort((a, b) => b.path.length - a.path.length)[0]
       const pick = owner || found.find((r) => r.kind === 'main') || found[0]
       setRepo(pick ? pick.path : '')
-      if (pick) await refresh(pick.path, target)
+      if (pick) await refresh(pick.path, target, true)
     } catch (err) {
       console.warn('[git-ops] scan', err.message)
     } finally {
@@ -150,6 +213,14 @@ function GitPane() {
     return () => { cancelled = true }
   }, [cwd, sessionKey, sessionId, scan])
 
+  // The agent commits in the same repo from its own tool calls; without a poll the pane
+  // would keep showing a stale file list until the user hit 刷新.
+  useEffect(() => {
+    if (!repo || busy) return undefined
+    const id = setInterval(() => { void refresh(repo, base) }, POLL_MS)
+    return () => clearInterval(id)
+  }, [repo, base, busy, refresh])
+
   const onPick = useCallback((path, on) => {
     setPicked((prev) => (on ? [...new Set([...prev, path])] : prev.filter((p) => p !== path)))
   }, [])
@@ -158,8 +229,7 @@ function GitPane() {
     if (!repo) return
     setDiff({ path, text: '加载中…', truncated: false })
     try {
-      const d = await api(`/diff?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`
-        + `&cwd=${encodeURIComponent(base || repo)}`)
+      const d = await api(`/diff?repo=${enc(repo)}&path=${enc(path)}&cwd=${enc(base || repo)}`)
       setDiff({ path: d.path, text: d.diff, truncated: d.truncated })
     } catch (err) {
       setDiff({ path, text: '无法读取 diff: ' + err.message, truncated: false })
@@ -171,8 +241,7 @@ function GitPane() {
   const openItem = useCallback(async (path) => {
     if (!repo) return
     try {
-      await api(`/tgit?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`
-        + `&cwd=${encodeURIComponent(base || repo)}`)
+      await api('/tgit', { repo, path, cwd: base || repo })
       return
     } catch (err) {
       console.warn('[git-ops] tortoisegit unavailable:', err.message)
@@ -202,31 +271,46 @@ function GitPane() {
     if (data) setMessage(data.message)
   }, [repo, picked, base, run])
 
-  const commitAndPush = useCallback(async () => {
-    if (!repo) return
+  const doCommit = useCallback(async () => {
+    if (!repo) return null
     const committed = await run('commit', '/commit',
       { repo, paths: picked, message: message.trim() ? message : '', cwd: base },
       (d) => `已提交 ${d.short} ${d.header}`, true)
-    if (!committed) return
+    if (!committed) return null
     setMessage('')
+    await refresh(repo, base)
+    return committed
+  }, [repo, picked, message, base, run, refresh])
+
+  const commitAndPush = useCallback(async () => {
+    const committed = await doCommit()
+    if (!committed) return
     const pushed = await run('push', '/push', { repo, cwd: base },
       (d) => (d.verified ? `已推送 ${d.short} (verified)` : `推送未确认 ${d.short} ahead=${d.ahead_after}`), true)
-    await refresh(repo)
+    await refresh(repo, base)
     if (!pushed) toast('提交已保存，但推送失败', 'warning')
-  }, [repo, picked, message, base, run, refresh, toast])
+  }, [doCommit, repo, base, run, refresh, toast])
 
   const doPull = useCallback(async () => {
-    if (!repo) {
-      console.warn('[git-ops] pull skipped: no repo in the current workspace')
-      return
-    }
+    if (!repo) return
     const data = await run('pull', '/pull', { repo, cwd: base, submodules: true },
       (d) => (d.pulled ? `拉取 ${d.pulled} 个提交 ${d.old}→${d.new}` : '已是最新'))
-    if (data) await refresh(repo)
+    if (data) await refresh(repo, base)
   }, [repo, base, run, refresh])
 
+  const doDiscard = useCallback(async () => {
+    setConfirmDiscard(false)
+    if (!repo || !picked.length) return
+    const data = await run('discard', '/discard', { repo, paths: picked, cwd: base },
+      (d) => `已放弃 ${d.discarded.length} 个文件的修改`, true)
+    if (data) await refresh(repo, base)
+  }, [repo, picked, base, run, refresh])
+
+  const files = (status && status.files) || []
   const repoReady = Boolean(repo) && repos.some((r) => r.path === repo)
   const disabled = !repoReady || Boolean(busy)
+  const allPicked = files.length > 0 && picked.length === files.length
+  const repoLabel = useMemo(() => (repo ? baseName(repo) : ''), [repo])
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-2 overflow-hidden p-3 text-sm',
@@ -259,7 +343,8 @@ function GitPane() {
                   setRepo(r.path)
                   setMessage('')
                   setDiff(null)
-                  refresh(r.path)
+                  setPicked([])
+                  void refresh(r.path, base, true)
                 },
                 className: 'flex w-full items-center gap-1 px-1.5 py-1 text-left text-xs',
                 style: {
@@ -278,36 +363,16 @@ function GitPane() {
             })
           : jsx('div', { className: 'px-1.5 py-1 text-xs', style: MUTED, children: '未找到仓库' })
       }),
-      jsx('div', {
-        className: 'min-h-0 flex-1 overflow-auto rounded border p-1',
-        style: STROKE,
-        children: status && status.files.length
-          ? status.files.map((f) => jsxs('div', {
-              className: 'flex items-center gap-2 px-1 py-0.5 text-xs',
-              children: [
-                jsx('input', {
-                  type: 'checkbox',
-                  className: 'cursor-pointer',
-                  checked: picked.includes(f.path),
-                  onChange: (e) => onPick(f.path, e.target.checked)
-                }),
-                jsx('span', {
-                  className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
-                  title: '点击用 TortoiseGit 查看 diff（不可用时内置视图）',
-                  onClick: () => void openItem(f.path),
-                  children: [
-                    jsx('span', { style: { ...MONO, ...MUTED }, children: f.code }),
-                    jsx('span', { className: 'truncate', children: f.path })
-                  ]
-                })
-              ]
-            }, f.path + f.code))
-          : jsx('div', { className: 'p-1 text-xs', style: MUTED,
-              children: repoReady ? '工作区干净' : '无 Git 仓库' })
-      }),
+      files.length
+        ? jsx(FileList, { files, picked, onPick, onOpen: openItem })
+        : jsx('div', {
+            className: 'min-h-0 flex-1 overflow-auto rounded border p-1 text-xs',
+            style: { ...STROKE, ...MUTED },
+            children: jsx('div', { className: 'p-1', children: repoReady ? '工作区干净' : '无 Git 仓库' })
+          }),
       jsx(Textarea, {
         value: message,
-        rows: 4,
+        rows: 3,
         placeholder: '提交信息（可留空，提交时自动生成）',
         onChange: (e) => setMessage(e.target.value),
         className: 'text-xs',
@@ -317,14 +382,31 @@ function GitPane() {
         style: STROKE
       }),
       jsxs('div', { className: 'grid shrink-0 grid-cols-3 gap-1', children: [
-        jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full', disabled: disabled || !picked.length,
-          onClick: generate, children: busy === 'info' ? '生成中…' : '生成信息' }),
-        jsx(Button, { size: 'sm', className: 'w-full', disabled: disabled || !picked.length,
-          onClick: commitAndPush,
-          children: busy === 'commit' ? '提交中…' : busy === 'push' ? '推送中…' : '提交并推送' }),
-        jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full', disabled, onClick: doPull,
-          children: busy === 'pull' ? '拉取中…' : '拉取' })
+        jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full',
+          disabled: disabled || !picked.length, onClick: generate,
+          children: busy === 'info' ? '生成中…' : '生成信息' }),
+        jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full',
+          disabled: disabled || !picked.length, onClick: doCommit,
+          children: busy === 'commit' ? '提交中…' : '仅提交' }),
+        jsx(Button, { size: 'sm', className: 'w-full',
+          disabled: disabled || !picked.length, onClick: commitAndPush,
+          children: busy === 'push' ? '推送中…' : '提交并推送' })
       ] }),
+      jsxs('div', { className: 'grid shrink-0 grid-cols-3 gap-1', children: [
+        jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full',
+          disabled: disabled || allPicked || !files.length,
+          onClick: () => setPicked(files.map((f) => f.path)),
+          children: '全选' }),
+        jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full',
+          disabled: disabled || !picked.length, onClick: () => setPicked([]),
+          children: '清空' }),
+        jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full',
+          disabled: disabled || !picked.length, onClick: () => setConfirmDiscard(true),
+          children: busy === 'discard' ? '放弃中…' : '放弃修改' })
+      ] }),
+      jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full shrink-0',
+        disabled, onClick: doPull,
+        children: busy === 'pull' ? '拉取中…' : '拉取' }),
       jsx(Dialog, {
         open: Boolean(diff),
         onOpenChange: (open) => { if (!open) setDiff(null) },
@@ -344,6 +426,28 @@ function GitPane() {
               diff && diff.truncated
                 ? jsx('div', { className: 'text-xs', style: MUTED, children: 'diff 已截断' })
                 : null
+            ]
+          })
+        })
+      }),
+      jsx(Dialog, {
+        open: confirmDiscard,
+        onOpenChange: setConfirmDiscard,
+        children: jsx(DialogContent, {
+          className: 'max-w-md',
+          children: jsxs('div', {
+            className: 'flex flex-col gap-3',
+            children: [
+              jsx(DialogHeader, {
+                children: jsx(DialogTitle, { className: 'text-sm', children: '放弃修改？' })
+              }),
+              jsx('div', { className: 'text-xs', style: MUTED,
+                children: `将把 ${picked.length} 个已跟踪文件的索引与工作区还原到 HEAD，不可撤销。未跟踪文件不在其中。` }),
+              jsxs('div', { className: 'flex justify-end gap-2', children: [
+                jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => setConfirmDiscard(false),
+                  children: '取消' }),
+                jsx(Button, { size: 'sm', onClick: doDiscard, children: '确认放弃' })
+              ] })
             ]
           })
         })

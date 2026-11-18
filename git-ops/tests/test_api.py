@@ -1,28 +1,27 @@
 """Backend route tests for the git-ops dashboard half.
 
-Run with the Hermes venv python:
-  <install>/venv/Scripts/python.exe tests/test_api.py
+Run with any python that has fastapi installed:
+  python tests/test_api.py
+
+No Hermes install path and no model call are needed: the LLM door is stubbed, so this
+file cannot drift onto one machine's install layout.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
-import tempfile
 from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-HERMES_WORKSPACE = Path(os.environ.get("HERMES_WORKSPACE", r"C:\Users\as850\AppData\Local\hermes\installs"
-                                       r"\4b4c15b9b806dbf1\environments\f4d4c5cb0f0e4ab7a803513ce3c4cefb\workspace"))
-for extra in (str(HERMES_WORKSPACE),):
-    if extra not in sys.path:
-        sys.path.insert(0, extra)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from test_gitops import Fixture  # noqa: E402
+from test_gitops import Fixture, FakeLlm  # noqa: E402
+
+BASE = "/api/plugins/git-ops"
 
 
 def load_api():
@@ -36,8 +35,9 @@ def load_api():
 
 def main() -> int:
     api = load_api()
+    api._llm = lambda: FakeLlm()  # never reach the real model/config here
     app = FastAPI()
-    app.include_router(api.router, prefix="/api/plugins/git-ops")
+    app.include_router(api.router, prefix=BASE)
     client = TestClient(app)
     fx = Fixture()
     failures = []
@@ -49,44 +49,74 @@ def main() -> int:
 
     try:
         work = str(fx.work)
-        r = client.get("/api/plugins/git-ops/repos", params={"roots": str(fx.root), "cwd": work}).json()
+        r = client.get(f"{BASE}/repos", params={"roots": str(fx.root), "cwd": work}).json()
         check("GET /repos ok", r.get("ok"), r)
         kinds = {Path(x["path"]).name: x["kind"] for x in r["data"]["repos"]}
         check("scan sees submodule", kinds.get("lib") == "submodule", kinds)
+        check("scan lists each repo once",
+              len(r["data"]["repos"]) == len({x["path"].lower() for x in r["data"]["repos"]}), kinds)
 
-        r = client.get("/api/plugins/git-ops/status", params={"repo": ".", "cwd": work}).json()
+        r = client.get(f"{BASE}/status", params={"repo": ".", "cwd": work}).json()
         check("GET /status branch", r["ok"] and r["data"]["branch"] == "main", r)
 
+        r = client.get(f"{BASE}/status", params={"repo": ".", "cwd": ""}).json()
+        check("GET /status without cwd does not scan $HOME", r.get("ok") is False or r["data"]["path"], r)
+
         fx.write(fx.work, "api.txt", "x\n")
-        r = client.get("/api/plugins/git-ops/diff",
-                       params={"repo": ".", "path": "api.txt", "cwd": work}).json()
+        r = client.get(f"{BASE}/diff", params={"repo": ".", "path": "api.txt", "cwd": work}).json()
         check("GET /diff (new file)", r.get("ok") and "api.txt" in r["data"]["diff"], r)
 
         (fx.work / "readme.txt").write_text("hello\nchanged\n", encoding="utf-8")
-        r = client.get("/api/plugins/git-ops/diff",
-                       params={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+        r = client.get(f"{BASE}/diff", params={"repo": ".", "path": "readme.txt", "cwd": work}).json()
         check("GET /diff (tracked) has +++ b/ header",
               r.get("ok") and "+++ b/readme.txt" in r["data"]["diff"], r)
 
-        r = client.post("/api/plugins/git-ops/commit-info",
+        r = client.get(f"{BASE}/diff",
+                       params={"repo": ".", "path": "../escape.txt", "cwd": work}).json()
+        check("GET /diff refuses a path outside the repo",
+              r.get("ok") is False and "escapes" in r["error"], r)
+
+        fx.write(fx.work, "my file.txt", "spaced\n")
+        r = client.get(f"{BASE}/diff", params={"repo": ".", "path": "my file.txt", "cwd": work}).json()
+        check("GET /diff handles a path with a space",
+              r.get("ok") and "my file.txt" in r["data"]["diff"] and "spaced" in r["data"]["diff"], r)
+
+        r = client.post(f"{BASE}/commit-info",
                         json={"repo": ".", "paths": ["api.txt"], "cwd": work}).json()
         check("POST /commit-info", r.get("ok") and r["data"]["header"], r)
         message = r["data"]["message"] if r.get("ok") else ""
 
-        r = client.post("/api/plugins/git-ops/commit",
-                        json={"repo": ".", "paths": ["api.txt"], "message": message, "cwd": work}).json()
+        r = client.post(f"{BASE}/commit",
+                        json={"repo": ".", "paths": ["api.txt"], "message": message,
+                              "cwd": work}).json()
         check("POST /commit", r.get("ok") and r["data"]["sha"], r)
 
-        r = client.post("/api/plugins/git-ops/push", json={"repo": ".", "cwd": work}).json()
+        r = client.post(f"{BASE}/push", json={"repo": ".", "cwd": work}).json()
         check("POST /push verified", r.get("ok") and r["data"]["verified"], r)
 
-        r = client.post("/api/plugins/git-ops/pull",
+        r = client.post(f"{BASE}/pull",
                         json={"repo": ".", "cwd": work, "submodules": False}).json()
         check("POST /pull no-op", r.get("ok") and r["data"]["behind"] == 0, r)
 
-        r = client.post("/api/plugins/git-ops/commit",
+        r = client.post(f"{BASE}/commit",
                         json={"repo": ".", "paths": ["missing.txt"], "cwd": work}).json()
         check("POST /commit rejects bad path", r.get("ok") is False and "not present" in r["error"], r)
+
+        r = client.get(f"{BASE}/commit", params={"repo": ".", "cwd": work})
+        check("POST-only routes reject GET", r.status_code == 405, r.status_code)
+
+        # discard: tracked file only, untracked refused
+        (fx.work / "readme.txt").write_text("dirty\n", encoding="utf-8")
+        r = client.post(f"{BASE}/discard", json={"repo": ".", "paths": ["readme.txt"],
+                                                 "cwd": work}).json()
+        check("POST /discard restores a tracked file",
+              r.get("ok") and r["data"]["still_dirty"] == [], r)
+        fx.write(fx.work, "api-untracked.txt", "u\n")
+        r = client.post(f"{BASE}/discard", json={"repo": ".", "paths": ["api-untracked.txt"],
+                                                 "cwd": work}).json()
+        check("POST /discard refuses untracked",
+              r.get("ok") is False and "untracked" in r["error"], r)
+        (fx.work / "api-untracked.txt").unlink()
 
         # TortoiseGit bridge: stub the process so no GUI window opens during the test.
         calls = []
@@ -106,29 +136,31 @@ def main() -> int:
         api.subprocess = FakeSubprocess
         api._tgit_exe = lambda: r"C:\Program Files\TortoiseGit\bin\TortoiseGitProc.exe"
         try:
-            r = client.get("/api/plugins/git-ops/tgit",
-                           params={"repo": ".", "path": "readme.txt", "cwd": work}).json()
-            check("GET /tgit launches", r.get("ok") and r["data"]["launched"], r)
+            r = client.post(f"{BASE}/tgit",
+                            json={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+            check("POST /tgit launches", r.get("ok") and r["data"]["launched"], r)
             args = calls[0] if calls else []
-            check("GET /tgit asks for /command:diff with an absolute path",
+            check("POST /tgit asks for /command:diff with an absolute path",
                   len(args) == 4 and args[1] == "/command:diff" and args[2].startswith("/path:")
                   and args[2].lower().replace("\\", "/").endswith("readme.txt"), args)
+            check("GET /tgit is gone (no side effect on prefetch)",
+                  client.get(f"{BASE}/tgit", params={"repo": ".", "path": "readme.txt"}).status_code == 405)
 
             fx.write(fx.work, "tgit-untracked.txt", "x\n")
-            r = client.get("/api/plugins/git-ops/tgit",
-                           params={"repo": ".", "path": "tgit-untracked.txt", "cwd": work}).json()
-            check("GET /tgit refuses untracked", r.get("ok") is False and "untracked" in r["error"], r)
+            r = client.post(f"{BASE}/tgit",
+                            json={"repo": ".", "path": "tgit-untracked.txt", "cwd": work}).json()
+            check("POST /tgit refuses untracked", r.get("ok") is False and "untracked" in r["error"], r)
 
-            r = client.get("/api/plugins/git-ops/tgit",
-                           params={"repo": ".", "path": "../escape.txt", "cwd": work}).json()
-            check("GET /tgit refuses a path outside the repo",
+            r = client.post(f"{BASE}/tgit",
+                            json={"repo": ".", "path": "../escape.txt", "cwd": work}).json()
+            check("POST /tgit refuses a path outside the repo",
                   r.get("ok") is False and "escapes" in r["error"], r)
 
             api._tgit_exe = lambda: (_ for _ in ()).throw(api.gitops.GitOpsError("not installed"))
-            r = client.get("/api/plugins/git-ops/tgit",
-                           params={"repo": ".", "path": "readme.txt", "cwd": work}).json()
-            check("GET /tgit reports a missing TortoiseGit", r.get("ok") is False
-                  and "not installed" in r["error"], r)
+            r = client.post(f"{BASE}/tgit",
+                            json={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+            check("POST /tgit reports a missing TortoiseGit",
+                  r.get("ok") is False and "not installed" in r["error"], r)
         finally:
             api.subprocess, api._tgit_exe = real_subprocess, real_exe
     finally:

@@ -1,7 +1,7 @@
 """git-ops — deterministic git tools for Hermes.
 
-Six tools, one repo per call. Discovery (`git_repos`) lists every work tree under a
-root including submodules; commit/push/pull act on exactly the repo you name.
+Nine tools, one repo per call. Discovery (`git_repos`) lists every work tree under a
+root including submodules; commit/push/pull/discard act on exactly the repo you name.
 """
 
 from __future__ import annotations
@@ -37,6 +37,25 @@ _TOOLS = [
                        "upstream, dirty files, index.lock. Read-only.",
         "parameters": {"type": "object", "properties": {"repo": _REPO}},
     }, "📊"),
+    ("git_diff", {
+        "name": "git_diff",
+        "description": "Unified diff of one repo (or of explicit paths). Read-only; truncated at "
+                       "12000 chars. Use 'staged' for the index instead of the work tree.",
+        "parameters": {"type": "object", "properties": {
+            "repo": _REPO,
+            "paths": _PATHS,
+            "staged": {"type": "boolean", "description": "Diff the index against HEAD."},
+        }},
+    }, "🔍"),
+    ("git_log", {
+        "name": "git_log",
+        "description": "Recent commits of one repo as {sha, date, subject}. Read-only; "
+                       "the quickest way to read the house commit style.",
+        "parameters": {"type": "object", "properties": {
+            "repo": _REPO,
+            "limit": {"type": "integer", "description": "How many commits (default 20, max 200)."},
+        }},
+    }, "📜"),
     ("git_commit_info", {
         "name": "git_commit_info",
         "description": "Generate a Conventional Commits message from the selected diff, using the "
@@ -49,8 +68,9 @@ _TOOLS = [
     ("git_commit", {
         "name": "git_commit",
         "description": "Stage explicit paths and commit. Omit 'message' to generate one automatically "
-                       "(one extra model call). Message is validated before committing. For a "
-                       "submodule change, commit the submodule first, then the parent gitlink.",
+                       "(one extra model call). Message is validated before committing. Refuses when "
+                       "the index already holds changes outside those paths. For a submodule change, "
+                       "commit the submodule first, then the parent gitlink.",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO,
             "paths": _PATHS,
@@ -61,7 +81,7 @@ _TOOLS = [
     ("git_push", {
         "name": "git_push",
         "description": "Push the current branch and prove it landed (HEAD == @{u}, ahead == 0). "
-                       "Sets upstream with -u origin <branch> on first push. Never forces.",
+                       "Picks the configured pushRemote on first push. Never forces.",
         "parameters": {"type": "object", "properties": {"repo": _REPO}},
     }, "⬆️"),
     ("git_pull", {
@@ -77,28 +97,16 @@ _TOOLS = [
             "submodules": {"type": "boolean", "description": "Sync + update submodules (default true)."},
         }},
     }, "⬇️"),
+    ("git_discard", {
+        "name": "git_discard",
+        "description": "Throw away work-tree changes for explicit tracked paths (index and work tree "
+                       "back to HEAD). Irreversible. Untracked paths are refused.",
+        "parameters": {"type": "object", "properties": {
+            "repo": _REPO,
+            "paths": _PATHS,
+        }, "required": ["paths"]},
+    }, "🧹"),
 ]
-
-
-def _auto_commit(repo: str, paths: list[str], message: str, cwd: str, llm) -> dict:
-    if not message.strip():
-        message = gitops.commit_info(repo, paths, cwd, llm)["message"]
-    return gitops.commit(repo, paths, message, cwd)
-
-
-def _pull_many(roots: list[str], cwd: str, mode: str, submodules: bool) -> dict:
-    listing = gitops.scan(roots, 6, True)["repos"]
-    mains = [r["path"] for r in listing if r["kind"] == "main"]
-    subs = [r["path"] for r in listing if r["kind"] == "submodule"]
-    results = []
-    for path in mains + subs:  # parents first: a submodule pull can collide with the parent's update
-        try:
-            results.append(gitops.pull(path, cwd, mode, submodules))
-        except gitops.GitOpsError as exc:
-            results.append({"path": path, "error": str(exc)})
-    failed = [r for r in results if "error" in r]
-    state = "failed" if failed and len(failed) == len(results) else "partial" if failed else "ok"
-    return {"status": state, "scanned": len(results), "results": results}
 
 
 def register(ctx) -> None:
@@ -117,12 +125,20 @@ def register(ctx) -> None:
     def h_status(args, **_kw):
         return gitops.envelope(gitops.status, args.get("repo") or ".", cwd())
 
+    def h_diff(args, **_kw):
+        return gitops.envelope(gitops.text_diff, args.get("repo") or ".", args.get("paths") or [],
+                               cwd(), bool(args.get("staged", False)))
+
+    def h_log(args, **_kw):
+        return gitops.envelope(gitops.log, args.get("repo") or ".", int(args.get("limit") or 20),
+                               cwd())
+
     def h_info(args, **_kw):
         return gitops.envelope(gitops.commit_info, args.get("repo") or ".",
                                args.get("paths") or [], cwd(), ctx.llm)
 
     def h_commit(args, **_kw):
-        return gitops.envelope(_auto_commit, args.get("repo") or ".", args.get("paths") or [],
+        return gitops.envelope(gitops.auto_commit, args.get("repo") or ".", args.get("paths") or [],
                                args.get("message") or "", cwd(), ctx.llm)
 
     def h_push(args, **_kw):
@@ -132,11 +148,16 @@ def register(ctx) -> None:
         mode = args.get("mode") or "ff"
         submodules = bool(args.get("submodules", True))
         if args.get("roots"):
-            return gitops.envelope(_pull_many, args["roots"], cwd(), mode, submodules)
+            return gitops.envelope(gitops.pull_many, args["roots"], cwd(), mode, submodules)
         return gitops.envelope(gitops.pull, args.get("repo") or ".", cwd(), mode, submodules)
 
-    handlers = {"git_repos": h_repos, "git_status": h_status, "git_commit_info": h_info,
-                "git_commit": h_commit, "git_push": h_push, "git_pull": h_pull}
+    def h_discard(args, **_kw):
+        return gitops.envelope(gitops.discard, args.get("repo") or ".",
+                               args.get("paths") or [], cwd())
+
+    handlers = {"git_repos": h_repos, "git_status": h_status, "git_diff": h_diff,
+                "git_log": h_log, "git_commit_info": h_info, "git_commit": h_commit,
+                "git_push": h_push, "git_pull": h_pull, "git_discard": h_discard}
     for name, schema, emoji in _TOOLS:
         ctx.register_tool(name=name, toolset="git-ops", schema=schema,
                           handler=handlers[name], check_fn=lambda: bool(gitops.GIT), emoji=emoji)

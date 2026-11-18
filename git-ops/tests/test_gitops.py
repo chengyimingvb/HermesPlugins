@@ -56,7 +56,12 @@ class Fixture:
                     "GIT_CONFIG_COUNT": "1",
                     "GIT_CONFIG_KEY_0": "protocol.file.allow",
                     "GIT_CONFIG_VALUE_0": "always"}
-        os.environ.update({k: v for k, v in self.env.items() if k.startswith("GIT_")})
+        # Hand the sandbox to gitops through its own override hook: os.environ is global
+        # state and mutating it here leaks into every other test in this process.
+        self._saved_overrides = dict(gitops.ENV_OVERRIDES)
+        gitops.ENV_OVERRIDES.update({
+            key: value for key, value in self.env.items() if key.startswith("GIT_")
+        })
         self.origin = self._bare("origin.git")
         self.work = self._clone(self.origin, "work")
         self._initial_commit(self.work, "readme.txt")
@@ -95,6 +100,8 @@ class Fixture:
         return name
 
     def close(self):
+        gitops.ENV_OVERRIDES.clear()
+        gitops.ENV_OVERRIDES.update(self._saved_overrides)
         shutil.rmtree(self.root, ignore_errors=True)
 
 
@@ -129,12 +136,35 @@ class GitOpsTests(unittest.TestCase):
         st = gitops.status(".", str(self.fx.work))
         self.assertEqual(st["branch"], "main")
         self.assertEqual(st["upstream"], "origin/main")
-        self.assertEqual(st["ahead"], 0)
+        # Parity with git itself: earlier tests leave local commits unpushed.
+        expected = run("rev-list", "--left-right", "--count", "HEAD...@{u}",
+                       cwd=self.fx.work, env=self.fx.env).stdout.split()
+        self.assertEqual(st["ahead"], int(expected[0]))
+        self.assertEqual(st["behind"], int(expected[1]))
         self.assertTrue(st["head"])
         self.fx.write(self.fx.work, "status-probe.txt", "p\n")
         codes = [f["path"] for f in gitops.status(".", str(self.fx.work))["files"]]
         self.assertIn("status-probe.txt", codes)
         os.remove(self.fx.work / "status-probe.txt")
+
+    def test_status_costs_one_git_status_call(self):
+        """One `status --porcelain=v2 --branch` supplies branch/upstream/ahead/behind/files."""
+        calls = []
+        real = gitops._run
+
+        def spy(args, cwd=None, timeout=60):
+            calls.append(args[0])
+            return real(args, cwd, timeout)
+
+        gitops._run = spy
+        try:
+            gitops.status(".", str(self.fx.work))
+        finally:
+            gitops._run = real
+        self.assertEqual(calls.count("status"), 1, calls)
+        self.assertNotIn("symbolic-ref", calls)
+        self.assertNotIn("rev-list", calls)
+        self.assertLessEqual(len(calls), 4, calls)
 
     def test_scan_finds_submodule(self):
         listing = gitops.scan([str(self.fx.root)], 6, True)
@@ -143,7 +173,7 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(kinds.get("lib"), "submodule")
         lib = next(r for r in listing["repos"] if r["path"].endswith("work/subs/lib"))
         self.assertEqual(lib["kind"], "submodule")
-        self.assertTrue(lib["parent"].endswith("work"))
+        self.assertTrue(lib["parent"].endswith("work"), lib)
         without = gitops.scan([str(self.fx.work)], 6, False)
         self.assertEqual([r["kind"] for r in without["repos"]], ["main"])
 
@@ -161,6 +191,21 @@ class GitOpsTests(unittest.TestCase):
             gitops.commit(".", ["."], "feat: ok", str(self.fx.work))
         with self.assertRaises(gitops.GitOpsError):
             gitops.commit(".", ["nope.txt"], "feat: ok", str(self.fx.work))
+
+    def test_commit_refuses_unselected_staged_changes(self):
+        """别的文件已经 staged 时不能顺手带上：报错而不是静默扩大提交范围。"""
+        self.fx.write(self.fx.work, "staged-other.txt", "o\n")
+        run("add", "staged-other.txt", cwd=self.fx.work, env=self.fx.env)
+        self.fx.write(self.fx.work, "wanted.txt", "t\n")
+        with self.assertRaises(gitops.GitOpsError) as ctx:
+            gitops.commit(".", ["wanted.txt"], "feat: 只提交 wanted", str(self.fx.work))
+        self.assertIn("staged-other.txt", str(ctx.exception))
+        head_files = run("show", "--name-only", "--format=", "HEAD",
+                         cwd=self.fx.work, env=self.fx.env).stdout
+        self.assertNotIn("wanted.txt", head_files)
+        run("restore", "--staged", "staged-other.txt", cwd=self.fx.work, env=self.fx.env)
+        result = gitops.commit(".", ["wanted.txt"], "feat: 只提交 wanted", str(self.fx.work))
+        self.assertEqual(result["files"], ["wanted.txt"])
 
     def test_commit_push_verified(self):
         self.fx.write(self.fx.work, "b.txt", "b\n")
@@ -206,6 +251,15 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(run("status", "--short", cwd=consumer,
                              env=self.fx.env).returncode, 0)
 
+    def test_pull_up_to_date_still_syncs_submodules(self):
+        self.fx.write(self.fx.work, "u.txt", "u\n")
+        gitops.commit(".", ["u.txt"], "feat: 增加 u 文件", str(self.fx.work))
+        gitops.push(".", str(self.fx.work))
+        result = gitops.pull(".", str(self.fx.work))
+        self.assertEqual(result["pulled"], 0)
+        self.assertIsNotNone(result["submodules"], result)
+        self.assertEqual(result["submodules"]["needs_attention"], [])
+
     def test_commit_info_redacts_secrets(self):
         self.fx.write(self.fx.work, "secret.txt", "token = ghp_" + "a" * 30 + "\n")
         llm = FakeLlm()
@@ -218,8 +272,7 @@ class GitOpsTests(unittest.TestCase):
 
     def test_auto_commit_without_message(self):
         self.fx.write(self.fx.work, "auto.txt", "auto\n")
-        plugin = load_plugin()
-        result = plugin._auto_commit(".", ["auto.txt"], "", str(self.fx.work), FakeLlm())
+        result = gitops.auto_commit(".", ["auto.txt"], "", str(self.fx.work), FakeLlm())
         self.assertTrue(result["sha"])
         header = run("log", "-1", "--format=%s", cwd=self.fx.work).stdout.strip()
         self.assertTrue(header.startswith("fix(core):"), header)
@@ -239,8 +292,9 @@ class GitOpsTests(unittest.TestCase):
                 calls[kwargs["name"]] = kwargs
 
         plugin.register(FakeCtx())
-        self.assertEqual(sorted(calls), sorted(["git_repos", "git_status", "git_commit_info",
-                                                "git_commit", "git_push", "git_pull"]))
+        self.assertEqual(sorted(calls), sorted([
+            "git_repos", "git_status", "git_diff", "git_log", "git_commit_info",
+            "git_commit", "git_push", "git_pull", "git_discard"]))
         for name, kwargs in calls.items():
             self.assertEqual(kwargs["schema"]["name"], name)
             self.assertEqual(kwargs["toolset"], "git-ops")
@@ -249,16 +303,32 @@ class GitOpsTests(unittest.TestCase):
         payload = json.loads(calls["git_status"]["handler"]({"repo": "."}))
         self.assertTrue(payload["ok"], payload)
         self.assertEqual(payload["data"]["branch"], "main")
+        resources = json.loads(calls["git_repos"]["handler"]({}))
+        self.assertTrue(resources["ok"], resources)
+        self.assertGreaterEqual(resources["data"]["count"], 1)
 
     def test_pull_many_ordering_and_status(self):
-        plugin = load_plugin()
-        out = plugin._pull_many([str(self.fx.root)], str(self.fx.root), "ff", False)
+        out = gitops.pull_many([str(self.fx.root)], str(self.fx.root), "ff", False)
         self.assertEqual(out["scanned"], len(out["results"]))
         self.assertIn(out["status"], {"ok", "partial", "failed"})
-        paths = [repos["path"] for repos in out["results"]]
-        for entry in out["results"]:
-            if entry.get("parent"):
-                self.assertLess(paths.index(entry["parent"]), paths.index(entry["path"]))
+        paths = [r["path"].replace("\\", "/") for r in out["results"]]
+        sub = next(i for i, p in enumerate(paths) if p.endswith("work/subs/lib"))
+        parent = paths.index(next(p for p in paths if p.endswith("/work")))
+        self.assertLess(parent, sub, paths)
+
+    def test_push_picks_the_configured_remote(self):
+        """首次推送不能写死 origin：只有 upstream 远端时要推它，并报出真实上游。"""
+        mirror = self.fx._bare("mirror.git")
+        solo = self.fx.root / "solo"
+        run("init", "-b", "main", str(solo), env=self.fx.env)
+        run("remote", "add", "upstream", str(mirror), cwd=solo, env=self.fx.env)
+        (solo / "x.txt").write_text("x\n", encoding="utf-8")
+        gitops.commit(".", ["x.txt"], "feat: 增加 x 文件", str(solo))
+        pushed = gitops.push(".", str(solo))
+        self.assertTrue(pushed["verified"], pushed)
+        self.assertEqual(pushed["upstream"], "upstream/main")
+        self.assertEqual(run("rev-parse", "--abbrev-ref", "@{u}", cwd=solo,
+                             env=self.fx.env).stdout.strip(), "upstream/main")
 
     def test_dirty_rename_shape(self):
         self.fx.write(self.fx.work, "old.txt", "x\n")
@@ -269,6 +339,48 @@ class GitOpsTests(unittest.TestCase):
         self.assertTrue(moved, files)
         self.assertEqual(moved[0]["path"], "new.txt")
         self.assertEqual(moved[0]["from"], "old.txt")
+        # Land the rename: a staged rename left behind would make every later test's
+        # commit fail the "index holds nothing outside the selected paths" guard.
+        gitops.commit(".", ["new.txt", "old.txt"], "chore: 重命名 old 为 new", str(self.fx.work))
+
+    def test_path_with_spaces_is_one_path(self):
+        """`--name-only` 输出按空白切分会把 "my file.txt" 拆成两项并丢掉正文（-z 才行）。"""
+        self.fx.write(self.fx.work, "my file.txt", "hello\n")
+        diff, files, _truncated = gitops._diff(str(self.fx.work), [])
+        self.assertIn("my file.txt", files, files)
+        self.assertNotIn("file.txt", files, files)
+        self.assertIn("new file: my file.txt", diff)
+        self.assertIn("hello", diff)
+        os.remove(self.fx.work / "my file.txt")
+
+    def test_text_diff_and_log(self):
+        self.fx.write(self.fx.work, "prof.txt", "one\n")
+        gitops.commit(".", ["prof.txt"], "feat: 增加 prof 文件", str(self.fx.work))
+        self.fx.write(self.fx.work, "prof.txt", "two\n")
+        walked = gitops.text_diff(".", ["prof.txt"], str(self.fx.work))
+        self.assertIn("+two", walked["diff"])
+        self.assertEqual(walked["files"], ["prof.txt"])
+        self.assertFalse(walked["truncated"])
+        commits = gitops.log(".", 3, str(self.fx.work))
+        self.assertLessEqual(commits["count"], 3)
+        self.assertTrue(commits["commits"][0]["subject"].startswith("feat: 增加 prof"))
+        self.assertTrue(commits["commits"][0]["sha"])
+
+    def test_discard(self):
+        self.fx.write(self.fx.work, "keep.txt", "v1\n")
+        gitops.commit(".", ["keep.txt"], "feat: 增加 keep 文件", str(self.fx.work))
+        self.fx.write(self.fx.work, "keep.txt", "v2\n")
+        result = gitops.discard(".", ["keep.txt"], str(self.fx.work))
+        self.assertEqual(result["discarded"], ["keep.txt"])
+        self.assertEqual(result["still_dirty"], [])
+        self.assertEqual((self.fx.work / "keep.txt").read_text(encoding="utf-8"), "v1\n")
+        # untracked is refused, never deleted
+        self.fx.write(self.fx.work, "fresh.txt", "f\n")
+        with self.assertRaises(gitops.GitOpsError) as ctx:
+            gitops.discard(".", ["fresh.txt"], str(self.fx.work))
+        self.assertIn("untracked", str(ctx.exception))
+        self.assertTrue((self.fx.work / "fresh.txt").exists())
+        os.remove(self.fx.work / "fresh.txt")
 
 
 if __name__ == "__main__":

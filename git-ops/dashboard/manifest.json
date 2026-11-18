@@ -1,7 +1,7 @@
 {
   "name": "git-ops",
   "label": "Git Ops",
-  "description": "Repo discovery, status, generated commit messages, commit, push and pull — backed by the git-ops agent plugin.",
-  "version": "0.2.0",
+  "description": "Repo discovery, status, diffs, generated commit messages, commit, push, pull and discard — backed by the git-ops agent plugin.",
+  "version": "0.3.0",
   "api": "plugin_api.py"
 }

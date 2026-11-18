@@ -1,6 +1,10 @@
 """git-ops core: discovery, status, commit, push, pull — all subprocess-based, no shell.
 
 Every public function returns a dict; ``__init__`` wraps them in the tool JSON envelope.
+
+Performance shape: one ``git status --porcelain=v2 --branch -z`` per repo supplies branch,
+upstream, ahead/behind and the dirty list at once (4-8 calls collapsed into 1), and a scan
+probes repositories through a thread pool (DgitWork, 48 repos: 19.2s -> ~1s of git time).
 """
 
 from __future__ import annotations
@@ -11,12 +15,19 @@ import re
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-SKIP_DIRS = {"Library", "Temp", "obj", "node_modules", ".git", ".vs", "Builds", "Logs"}
+SKIP_DIRS = {
+    "Library", "Temp", "obj", "node_modules", ".git", ".vs", "Builds", "Logs",
+    ".venv", "venv", "__pycache__", ".idea", ".next", ".nuxt", ".pytest_cache",
+    ".mypy_cache", "coverage", ".gradle", "DerivedData", "Pods", "dist", "target",
+}
 GIT_TIMEOUT = {"status": 30, "commit": 120, "push": 300, "pull": 300, "scan": 120}
 MAX_SCAN_DEPTH = 8
+SCAN_WORKERS = 16
+DIFF_BUDGET = 12000
 VALID_TYPES = ("feat", "fix", "docs", "style", "refactor", "perf", "test",
                "build", "ci", "chore", "revert")
 HEADER_RE = re.compile(r"^(%s)(\([^)]+\))?!?: \S" % "|".join(VALID_TYPES))
@@ -28,6 +39,8 @@ SECRET_PATTERNS = (
     re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"),
     re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key|token)\b\s*[=:]\s*\S+"),
 )
+# Tests and embedders point git at a sandboxed config without touching os.environ.
+ENV_OVERRIDES: dict[str, str] = {}
 
 
 class GitOpsError(Exception):
@@ -58,6 +71,7 @@ def _env() -> dict:
         "LC_ALL": "C",
         "LANG": "C",
     })
+    env.update(ENV_OVERRIDES)
     return env
 
 
@@ -86,6 +100,26 @@ def toplevel(path: str) -> str:
     return proc.stdout.strip().replace("\\", "/")
 
 
+def _git_dir(top: str) -> Optional[Path]:
+    """The repository's git dir, resolved without a subprocess (a dir, or a ``gitdir:`` file)."""
+    dot = os.path.join(top, ".git")
+    if os.path.isdir(dot):
+        return Path(dot)
+    if os.path.isfile(dot):
+        try:
+            with open(dot, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith("gitdir:"):
+                        target = line.split(":", 1)[1].strip()
+                        found = Path(target) if os.path.isabs(target) else (Path(top) / target)
+                        # A submodule's gitdir is written as ../../.git/modules/<name>:
+                        # normalise so the parent work tree is readable off the prefix.
+                        return Path(os.path.normpath(str(found)))
+        except OSError:
+            return None
+    return None
+
+
 # ── repo resolution ───────────────────────────────────────────────────────
 
 def _scan_roots(roots: Iterable[str], depth: int = 6) -> list[str]:
@@ -106,40 +140,66 @@ def _scan_roots(roots: Iterable[str], depth: int = 6) -> list[str]:
     return hits
 
 
-def scan(roots: Optional[list[str]], depth: int = 6, submodules: bool = True) -> dict:
-    roots = [os.path.abspath(r) for r in (roots or [])]
+def _kind(top: str) -> dict:
+    """main/submodule + parent, decided from .git on disk (no subprocess)."""
+    dot = os.path.join(top, ".git")
+    if not os.path.isfile(dot):  # a real .git dir (or nothing): an ordinary work tree
+        return {"kind": "main", "parent": ""}
+    gitdir = _git_dir(top)
+    text = str(gitdir).replace("\\", "/") if gitdir else ""
+    if "/.git/modules/" in text:  # submodule: the parent work tree is the gitdir's prefix
+        return {"kind": "submodule", "parent": text.split("/.git/modules/")[0]}
+    return {"kind": "main", "parent": ""}  # a linked work tree keeps its own branch
+
+
+def _probe(top: str) -> Optional[dict]:
+    """One repo's light state: a single git call, plus a filesystem kind lookup."""
+    try:
+        state = _porcelain(top)
+    except GitOpsError:
+        return None
+    return {
+        "path": top.replace("\\", "/"),
+        **_kind(top),
+        "branch": state["branch"] or "DETACHED",
+        "upstream": state["upstream"],
+        "ahead": state["ahead"],
+        "behind": state["behind"],
+        "dirty": len(state["files"]),
+    }
+
+
+def _canon(path: str) -> str:
+    """One spelling per repository: a scan hit and `rev-parse --show-toplevel` must not double-count."""
+    return os.path.normpath(path).replace("\\", "/")
+
+
+def scan(roots: Optional[list[str]], depth: int = 6, submodules: bool = True,
+         workers: int = SCAN_WORKERS) -> dict:
+    roots = [os.path.abspath(os.path.expanduser(r)) for r in (roots or [])]
     if not roots:
         raise GitOpsError("no roots to scan")
-    hits = _scan_roots(roots, depth)
-    repos: dict[str, dict] = {}
+    tops: dict[str, str] = {}
+
+    def add(path: str) -> None:
+        tops.setdefault(os.path.normcase(_canon(path)), _canon(path))
+
+    for hit in _scan_roots(roots, depth):
+        add(hit)
     for root in roots:  # a root inside a work tree still surfaces that repo
         try:
-            top = toplevel(root)
+            add(toplevel(root))
         except GitOpsError:
             continue
-        repos.setdefault(top, {"path": top, **_kind(top)})
-    for hit in hits:
-        try:
-            top = toplevel(hit)
-        except GitOpsError:
-            continue
-        if top in repos:
-            continue
-        repos[top] = {"path": top, **_kind(top)}
-    items = []
-    for top in sorted(repos):
-        if not submodules and repos[top]["kind"] == "submodule":
-            continue
-        items.append({**repos[top], **_light_state(top)})
+    ordered = sorted(tops.values())
+    if len(ordered) <= 1:
+        probed = [_probe(t) for t in ordered]
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(ordered)))) as pool:
+            probed = list(pool.map(_probe, ordered))
+    items = [item for item in probed
+             if item and (submodules or item["kind"] != "submodule")]
     return {"roots": roots, "count": len(items), "repos": items}
-
-
-def _kind(top: str) -> dict:
-    proc = _run(["rev-parse", "--show-superproject-working-tree"], cwd=top, timeout=20)
-    parent = (proc.stdout or "").strip().replace("\\", "/") if proc.returncode == 0 else ""
-    if parent:
-        return {"kind": "submodule", "parent": parent}
-    return {"kind": "main", "parent": ""}
 
 
 def resolve_repo(repo: Optional[str], cwd: str) -> str:
@@ -162,69 +222,102 @@ def resolve_repo(repo: Optional[str], cwd: str) -> str:
 
 # ── state ────────────────────────────────────────────────────────────────
 
-def _dirty(top: str) -> list[dict]:
-    proc = _run(["status", "--porcelain=v1", "-z"], cwd=top, timeout=GIT_TIMEOUT["status"])
+def _porcelain(top: str) -> dict:
+    """branch / upstream / ahead / behind / files from one ``status --porcelain=v2 -z`` run.
+
+    Record shapes (NUL-terminated, so a path with spaces stays one path):
+      1 <XY> ... <path>              ordinary change
+      2 <XY> ... <path> NUL <origin> rename/copy: the original path is its own token
+      u <XY> ... <path>              unmerged
+      ? <path> / ! <path>            untracked / ignored
+    """
+    proc = _run(["status", "--porcelain=v2", "--branch", "-z"], cwd=top,
+                timeout=GIT_TIMEOUT["status"])
     if proc.returncode != 0:
         raise GitOpsError(proc.stderr.strip() or "git status failed")
-    entries, tokens, i = [], proc.stdout.split("\0"), 0
+    out = {"oid": "", "branch": "", "upstream": "", "ahead": None, "behind": None, "files": []}
+    tokens = proc.stdout.split("\0")
+    i = 0
     while i < len(tokens):
         token = tokens[i]
-        if not token:
-            i += 1
-            continue
-        code, path = token[:2], token[3:]
-        entry = {"code": code, "path": path}
-        if code[0] in "RC":
-            entry["from"] = tokens[i + 1] if i + 1 < len(tokens) else ""
-            i += 1
-        entries.append(entry)
         i += 1
-    return entries
+        if not token:
+            continue
+        kind = token[0]
+        if kind == "#":
+            key, _, value = token[2:].partition(" ")
+            if key == "branch.oid":
+                out["oid"] = "" if value.startswith("(") else value
+            elif key == "branch.head":
+                out["branch"] = "" if value.startswith("(") else value
+            elif key == "branch.upstream":
+                out["upstream"] = value
+            elif key == "branch.ab":
+                for part in value.split():
+                    if part.startswith("+"):
+                        out["ahead"] = int(part[1:] or 0)
+                    elif part.startswith("-"):
+                        out["behind"] = int(part[1:] or 0)
+        elif kind == "1":
+            fields = token.split(" ", 8)
+            if len(fields) > 8:
+                out["files"].append({"code": fields[1], "path": fields[8]})
+        elif kind == "2":
+            fields = token.split(" ", 9)
+            origin = tokens[i] if i < len(tokens) else ""
+            i += 1
+            if len(fields) > 9:
+                out["files"].append({"code": fields[1], "path": fields[9], "from": origin})
+        elif kind == "u":
+            fields = token.split(" ", 10)
+            if len(fields) > 10:
+                out["files"].append({"code": fields[1], "path": fields[10]})
+        elif kind in ("?", "!"):
+            out["files"].append({"code": "??" if kind == "?" else "!!", "path": token[2:]})
+    return out
 
 
-def _counts(top: str) -> dict:
-    proc = _run(["rev-list", "--left-right", "--count", "HEAD...@{u}"], cwd=top, timeout=30)
-    if proc.returncode != 0:
-        return {"ahead": None, "behind": None, "upstream": None, "gone": None}
-    parts = proc.stdout.split()
-    return {"ahead": int(parts[0]), "behind": int(parts[1])}
+def _dirty(top: str) -> list[dict]:
+    return _porcelain(top)["files"]
 
 
 def _light_state(top: str) -> dict:
-    branch = _run(["symbolic-ref", "--short", "-q", "HEAD"], cwd=top, timeout=20).stdout.strip()
-    upstream = _run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-                    cwd=top, timeout=20).stdout.strip()
-    counts = _counts(top) if upstream else {"ahead": None, "behind": None}
+    state = _porcelain(top)
     return {
-        "branch": branch or "DETACHED",
-        "upstream": upstream or "",
-        "ahead": counts["ahead"],
-        "behind": counts["behind"],
-        "dirty": len(_dirty(top)),
+        "branch": state["branch"] or "DETACHED",
+        "upstream": state["upstream"],
+        "ahead": state["ahead"],
+        "behind": state["behind"],
+        "dirty": len(state["files"]),
     }
 
 
 def _lock(top: str) -> str:
-    gitdir = _run(["rev-parse", "--git-dir"], cwd=top, timeout=20).stdout.strip()
+    gitdir = _git_dir(top)
     if not gitdir:
         return ""
-    lock = Path(gitdir) if os.path.isabs(gitdir) else Path(top) / gitdir
-    lock = lock / "index.lock"
-    if not lock.exists():
+    lock = gitdir / "index.lock"
+    try:
+        if not lock.exists():
+            return ""
+        return (f"stale? {lock} ({lock.stat().st_size} bytes) — "
+                "check for a running git process before removing")
+    except OSError:
         return ""
-    return f"stale? {lock} ({lock.stat().st_size} bytes) — check for a running git process before removing"
 
 
 def status(repo: str, cwd: str) -> dict:
     top = resolve_repo(repo, cwd)
-    state = _light_state(top)
+    state = _porcelain(top)
+    branch = state["branch"] or "DETACHED"
     gone = ""
-    if state["branch"] != "DETACHED":
+    if state["branch"]:
         gone = _run(["for-each-ref", "--format=%(upstream:track)",
-                     f"refs/heads/{state['branch']}"], cwd=top, timeout=20).stdout.strip()
-    files = _dirty(top)
-    return {"path": top, **state, "gone": gone, "files": files, "lock": _lock(top),
-            "head": _run(["rev-parse", "--short", "HEAD"], cwd=top, timeout=20).stdout.strip()}
+                     f"refs/heads/{branch}"], cwd=top, timeout=20).stdout.strip()
+    return {"path": top, "branch": branch, "upstream": state["upstream"],
+            "ahead": state["ahead"], "behind": state["behind"], "gone": gone,
+            "files": state["files"], "lock": _lock(top),
+            "head": state["oid"][:7] if state["oid"] else ""}
 
 
 # ── message validation ───────────────────────────────────────────────────
@@ -239,7 +332,7 @@ def validate_message(message: str) -> Optional[str]:
                 "%s" % "/".join(VALID_TYPES))
     if len(header) > 72:
         return f"header longer than 72 chars ({len(header)})"
-    subject = header.split(": ", 1)[1] if ": " in header else ""
+    subject = header.split(": ", 1)[1]
     if subject[:1].isupper():
         return "subject must start lowercase (lead with the native verb for non-Latin text)"
     if header.endswith("."):
@@ -253,39 +346,79 @@ def validate_message(message: str) -> Optional[str]:
     return None
 
 
-# ── commit ───────────────────────────────────────────────────────────────
+# ── paths / staging ──────────────────────────────────────────────────────
+
+SWEEPING = {"-A", "--all", ".", "-u", "--update", ":/*"}
+
 
 def _indexed(top: str) -> set[str]:
     """Paths in the index. A staged deletion is absent here but still known to git."""
     return set(p for p in _run(["ls-files", "-z"], cwd=top).stdout.split("\0") if p)
 
 
-def check_paths(top: str, paths: list[str]) -> None:
+def _guard_paths(paths: list[str]) -> None:
     if not paths:
         raise GitOpsError("paths is required: stage explicit paths (no 'add -A')")
-    if any(p in ("-A", "--all", ".", "-u") for p in paths):
+    if any(p in SWEEPING for p in paths):
         raise GitOpsError("refusing sweeping pathspecs; pass explicit file paths")
-    tracked = _indexed(top)
-    # A staged deletion is already out of the index, so "known to git" must include status paths.
-    tracked.update(p for entry in _dirty(top)
-                   for p in (entry["path"], entry.get("from", "")) if p)
+
+
+def _known_paths(top: str) -> tuple[set[str], list[dict]]:
+    """Index contents plus every path status mentions (a staged deletion lives only there)."""
+    indexed = _indexed(top)
+    files = _dirty(top)
+    known = set(indexed) | {p for entry in files
+                            for p in (entry["path"], entry.get("from", "")) if p}
+    return known, files
+
+
+def check_paths(top: str, paths: list[str]) -> None:
+    _guard_paths(paths)
+    known, _files = _known_paths(top)
     missing = [p for p in paths
-               if not os.path.exists(os.path.join(top, p)) and p not in tracked]
+               if not os.path.exists(os.path.join(top, p)) and p not in known]
     if missing:
         raise GitOpsError(f"path not present in work tree: {', '.join(missing)}")
 
 
+def _in_scope(path: str, paths: list[str]) -> bool:
+    """True when ``path`` is one of ``paths`` or lives under one of them (a listed directory)."""
+    return any(path == p or path.startswith(p.rstrip("/") + "/") for p in paths)
+
+
+def _staged_paths(top: str) -> list[str]:
+    return [p for p in _run(["diff", "--cached", "--name-only", "-z"],
+                            cwd=top).stdout.split("\0") if p]
+
+
 def _stage(top: str, paths: list[str]) -> list[str]:
-    check_paths(top, paths)
-    # A staged deletion exists neither in the work tree nor in the index, and `git add`
-    # fatals on such a pathspec ('did not match any files'). The deletion is already
-    # staged, so leave it out of the add instead of failing the whole commit.
-    indexed = _indexed(top)
-    addable = [p for p in paths if p in indexed or os.path.exists(os.path.join(top, p))]
+    """Add the named paths and prove the index holds nothing outside them.
+
+    A staged deletion exists neither in the work tree nor in the index and `git add`
+    fatals on that pathspec — it is already staged, so leave it out of the add. Any other
+    change already staged by the user is an error, never folded into this commit.
+    """
+    _guard_paths(paths)
+    known, files = _known_paths(top)
+    missing = [p for p in paths if not os.path.exists(os.path.join(top, p)) and p not in known]
+    if missing:
+        raise GitOpsError(f"path not present in work tree: {', '.join(missing)}")
+    addable = [p for p in paths if p in known and os.path.exists(os.path.join(top, p))]
     if addable:
         _ok(top, "add", "--", *addable)
-    staged = _run(["diff", "--cached", "--name-only", "-z"], cwd=top).stdout.split("\0")
-    return [p for p in staged if p]
+    staged = _staged_paths(top)
+    if not staged:
+        raise GitOpsError("nothing staged after 'git add' — paths matched no change")
+    renamed = {entry["from"]: entry["path"] for entry in files if entry.get("from")}
+    extras = [p for p in staged
+              if not _in_scope(p, paths)
+              and not (p in renamed and _in_scope(renamed[p], paths))]
+    if extras:
+        raise GitOpsError(
+            "index already holds changes outside the selected paths: "
+            + ", ".join(sorted(extras))
+            + " — unstage them (git restore --staged <path>) or add them to paths")
+    return staged
 
 
 def commit(repo: str, paths: list[str], message: str, cwd: str) -> dict:
@@ -296,8 +429,6 @@ def commit(repo: str, paths: list[str], message: str, cwd: str) -> dict:
     if problem:
         raise GitOpsError(f"invalid commit message: {problem}")
     staged = _stage(top, paths)
-    if not staged:
-        raise GitOpsError("nothing staged after 'git add' — paths matched no change")
     handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
     try:
         handle.write(message.rstrip() + "\n")
@@ -320,33 +451,44 @@ def _redact(text: str) -> tuple[str, int]:
     return text, hits
 
 
-def _in_scope(path: str, paths: list[str]) -> bool:
-    """True when ``path`` is one of ``paths`` or lives under one of them (a listed directory)."""
-    return any(path == p or path.startswith(p.rstrip("/") + "/") for p in paths)
-
-
 def _diff(repo: str, paths: list[str]) -> tuple[str, list[str], bool]:
-    """Every change the selected paths carry — staged, unstaged (edits and deletions), untracked."""
+    """Every change the selected paths carry — staged, unstaged (edits and deletions), untracked.
+
+    ``-z`` throughout: splitting ``--name-only`` output on whitespace turns ``my file.txt``
+    into two paths and silently drops its body from the diff handed to the model.
+    """
     scope = ["--", *paths] if paths else []
     chunks, files = [], []
     for base in (["diff", "--cached"], ["diff"]):
         chunk = _run(base + scope, cwd=repo, timeout=60).stdout
         if chunk.strip():
             chunks.append(chunk)
-        files += [p for p in _run(base + ["--name-only"] + scope, cwd=repo, timeout=60).stdout.split() if p]
-    diff = "\n".join(chunks)
-    untracked = [p for p in _run(["ls-files", "--others", "--exclude-standard"], cwd=repo).stdout.split()
-                 if not paths or _in_scope(p, paths)]
+        names = _run(base + ["--name-only", "-z"] + scope, cwd=repo, timeout=60).stdout
+        files += [p for p in names.split("\0") if p]
+    tracked = "\n".join(chunks)
+    untracked = [p for p in _run(["ls-files", "--others", "--exclude-standard", "-z"],
+                                 cwd=repo).stdout.split("\0")
+                 if p and (not paths or _in_scope(p, paths))]
+    body = tracked[:int(DIFF_BUDGET * 0.75)]
+    truncated = len(tracked) > len(body)
+    room = DIFF_BUDGET - len(body)
     for path in untracked[:10]:
-        full = os.path.join(repo, path)
         try:
-            with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                body = fh.read(4000)
+            with open(os.path.join(repo, path), "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read(4000)
         except OSError:
             continue
-        diff += f"\n--- new file: {path}\n{body}"
-    truncated = len(diff) > 12000
-    return diff[:12000], list(dict.fromkeys(files + untracked)), truncated
+        if "\x00" in content:  # binary: the text would be noise
+            continue
+        piece = f"\n--- new file: {path}\n{content}"
+        if len(piece) > room:
+            truncated = True
+            break
+        body += piece
+        room -= len(piece)
+    if len(untracked) > 10:
+        truncated = True
+    return body, list(dict.fromkeys(files + untracked)), truncated
 
 
 def commit_info(repo: str, paths: list[str], cwd: str, llm) -> dict:
@@ -358,6 +500,8 @@ def commit_info(repo: str, paths: list[str], cwd: str, llm) -> dict:
         raise GitOpsError("no changes to describe")
     diff, redactions = _redact(diff)
     history = _ok(top, "log", "-20", "--oneline", "--no-decorate").strip()
+    history, history_hits = _redact(history)
+    redactions += history_hits
     instructions = (
         "Write one Git commit message for the diff below.\n"
         "Format: '<type>(<scope>): <subject>' then a blank line then an optional body wrapped at 72 chars.\n"
@@ -383,7 +527,85 @@ def commit_info(repo: str, paths: list[str], cwd: str, llm) -> dict:
             "model": getattr(result, "model", "")}
 
 
+def auto_commit(repo: str, paths: list[str], message: str, cwd: str, llm) -> dict:
+    """Commit with the given message, or with one generated from the selected diff."""
+    if not (message or "").strip():
+        message = commit_info(repo, paths, cwd, llm)["message"]
+    return commit(repo, paths, message, cwd)
+
+
+# ── read-only helpers ────────────────────────────────────────────────────
+
+def text_diff(repo: str, paths: Optional[list[str]] = None, cwd: str = ".",
+              staged: bool = False) -> dict:
+    """The unified diff of the selected paths (work tree, or the index when ``staged``)."""
+    top = resolve_repo(repo, cwd)
+    scope = ["--", *paths] if paths else []
+    base = ["diff", "--cached"] if staged else ["diff"]
+    text = _run(base + scope, cwd=top, timeout=60).stdout
+    names = [p for p in _run(base + ["--name-only", "-z"] + scope,
+                             cwd=top, timeout=60).stdout.split("\0") if p]
+    body = text[:DIFF_BUDGET]
+    return {"path": top, "files": names, "diff": body,
+            "truncated": len(text) > len(body), "staged": staged}
+
+
+def log(repo: str, limit: int = 20, cwd: str = ".") -> dict:
+    """Recent commits as {sha, date, subject}."""
+    top = resolve_repo(repo, cwd)
+    limit = max(1, min(int(limit or 20), 200))
+    out = _ok(top, "log", f"-{limit}", "--date=short", "--format=%h%x1f%ad%x1f%s")
+    commits = []
+    for line in out.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) == 3:
+            commits.append({"sha": parts[0], "date": parts[1], "subject": parts[2]})
+    return {"path": top, "count": len(commits), "commits": commits}
+
+
+def discard(repo: str, paths: list[str], cwd: str) -> dict:
+    """Throw work-tree changes away for tracked paths (index and work tree back to HEAD).
+
+    Untracked paths are refused: deleting a file the user never committed is not a
+    decision this tool should make for them.
+    """
+    top = resolve_repo(repo, cwd)
+    _guard_paths(paths)
+    indexed = _indexed(top)
+    untracked = [p for p in paths if p not in indexed]
+    if untracked:
+        raise GitOpsError("refusing to discard untracked paths (delete them yourself): "
+                          + ", ".join(untracked))
+    try:
+        _ok(top, "restore", "--source=HEAD", "--staged", "--worktree", "--", *paths,
+            timeout=GIT_TIMEOUT["commit"])
+    except GitOpsError:
+        # A file absent from HEAD cannot be restored from it: unstage, then check out.
+        _run(["restore", "--staged", "--", *paths], cwd=top, timeout=GIT_TIMEOUT["commit"])
+        _ok(top, "checkout", "--", *paths, timeout=GIT_TIMEOUT["commit"])
+    touched = set(paths)
+    remaining = [f["path"] for f in _dirty(top) if f["path"] in touched]
+    return {"path": top, "discarded": paths, "still_dirty": remaining}
+
+
 # ── push ─────────────────────────────────────────────────────────────────
+
+def _remote_for(top: str, branch: str) -> str:
+    """branch.<name>.pushRemote, then remote.pushDefault, then branch.<name>.remote, then a guess."""
+    for key in (f"branch.{branch}.pushRemote", "remote.pushDefault", f"branch.{branch}.remote"):
+        proc = _run(["config", "--get", key], cwd=top, timeout=20)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    remotes = [r for r in _run(["remote"], cwd=top, timeout=20).stdout.split() if r]
+    if "origin" in remotes:
+        return "origin"
+    if len(remotes) == 1:
+        return remotes[0]
+    if not remotes:
+        raise GitOpsError("no remote configured; add one with 'git remote add origin <url>'")
+    raise GitOpsError(f"cannot pick a remote among {', '.join(remotes)}; "
+                      "set branch.<name>.remote or an upstream first")
+
 
 def push(repo: str, cwd: str) -> dict:
     top = resolve_repo(repo, cwd)
@@ -391,21 +613,37 @@ def push(repo: str, cwd: str) -> dict:
     if state["branch"] == "DETACHED":
         raise GitOpsError("detached HEAD: check out a branch before pushing")
     if not state["upstream"]:
-        _ok(top, "push", "-u", "origin", state["branch"], timeout=GIT_TIMEOUT["push"])
+        remote = _remote_for(top, state["branch"])
+        _ok(top, "push", "-u", remote, state["branch"], timeout=GIT_TIMEOUT["push"])
     else:
         proc = _run(["push"], cwd=top, timeout=GIT_TIMEOUT["push"])
         if proc.returncode != 0:
             raise GitOpsError((proc.stderr or proc.stdout).strip() or "git push failed")
-    head = _ok(top, "rev-parse", "HEAD").strip()
+    after = _porcelain(top)
+    head = after["oid"] or _ok(top, "rev-parse", "HEAD").strip()
     upstream_sha = _run(["rev-parse", "@{u}"], cwd=top).stdout.strip()
-    counts = _counts(top)
-    verified = head == upstream_sha and counts.get("ahead") == 0
-    return {"path": top, "branch": state["branch"], "upstream": state["upstream"] or "origin/" + state["branch"],
+    verified = head == upstream_sha and after["ahead"] == 0
+    return {"path": top, "branch": after["branch"] or state["branch"],
+            "upstream": after["upstream"] or state["upstream"],
             "sha": head, "short": head[:8], "verified": verified,
-            "ahead_after": counts.get("ahead")}
+            "ahead_after": after["ahead"]}
 
 
 # ── pull ─────────────────────────────────────────────────────────────────
+
+def _sync_submodules(top: str) -> Optional[dict]:
+    if not os.path.isfile(os.path.join(top, ".gitmodules")):
+        return None
+    _run(["submodule", "sync", "--recursive"], cwd=top, timeout=GIT_TIMEOUT["pull"])
+    sub = _run(["submodule", "update", "--init", "--recursive"], cwd=top,
+               timeout=GIT_TIMEOUT["pull"])
+    if sub.returncode != 0:
+        raise GitOpsError("pull landed but submodule update failed: "
+                          + (sub.stderr or sub.stdout).strip())
+    listing = _ok(top, "submodule", "status", "--recursive").strip().splitlines()
+    return {"count": len(listing),
+            "needs_attention": [ln for ln in listing if ln[:1] in ("-", "U")]}
+
 
 def pull(repo: str, cwd: str, mode: str = "ff", submodules: bool = True) -> dict:
     top = resolve_repo(repo, cwd)
@@ -417,36 +655,50 @@ def pull(repo: str, cwd: str, mode: str = "ff", submodules: bool = True) -> dict
     fetch = _run(["fetch", "--all", "--prune", "--tags"], cwd=top, timeout=GIT_TIMEOUT["pull"])
     if fetch.returncode != 0:
         raise GitOpsError((fetch.stderr or fetch.stdout).strip() or "git fetch failed")
-    counts = _counts(top)
-    ahead, behind = counts.get("ahead") or 0, counts.get("behind") or 0
-    old = _ok(top, "rev-parse", "--short", "HEAD").strip()
+    counts = _porcelain(top)
+    ahead, behind = counts["ahead"] or 0, counts["behind"] or 0
+    old = (counts["oid"] or _ok(top, "rev-parse", "HEAD").strip())[:7]
     if behind == 0:
         return {"path": top, "branch": state["branch"], "pulled": 0, "old": old, "new": old,
-                "ahead": ahead, "behind": 0, "note": "already up to date"}
+                "ahead": ahead, "behind": 0,
+                "submodules": _sync_submodules(top) if submodules else None,
+                "note": "already up to date"}
     if ahead and behind:
         raise GitOpsError(f"diverged: ahead {ahead}, behind {behind} — resolve by hand "
                           "(rebase or merge), this tool does not create merge commits")
     if mode not in ("ff", "rebase"):
         raise GitOpsError("mode must be 'ff' or 'rebase'")
-    proc = _run(["pull", "--ff-only" if mode == "ff" else "--rebase"], cwd=top,
-                timeout=GIT_TIMEOUT["pull"])
+    # The fetch above already moved @{u}, so merge/rebase it directly: a second `git pull`
+    # would repeat the network round trip and widen the race window for nothing.
+    command = ["merge", "--ff-only", "@{u}"] if mode == "ff" else ["rebase", "@{u}"]
+    proc = _run(command, cwd=top, timeout=GIT_TIMEOUT["pull"])
     if proc.returncode != 0:
-        raise GitOpsError((proc.stderr or proc.stdout).strip() or "git pull failed")
-    new = _ok(top, "rev-parse", "--short", "HEAD").strip()
-    result = {"path": top, "branch": state["branch"], "pulled": behind, "old": old, "new": new,
-              "ahead": 0, "behind": 0, "submodules": None}
-    if submodules and os.path.isfile(os.path.join(top, ".gitmodules")):
-        _run(["submodule", "sync", "--recursive"], cwd=top, timeout=GIT_TIMEOUT["pull"])
-        sub = _run(["submodule", "update", "--init", "--recursive"], cwd=top, timeout=GIT_TIMEOUT["pull"])
-        if sub.returncode != 0:
-            raise GitOpsError("pull landed but submodule update failed: "
-                              + (sub.stderr or sub.stdout).strip())
-        listing = _ok(top, "submodule", "status", "--recursive").strip().splitlines()
-        result["submodules"] = {
-            "count": len(listing),
-            "needs_attention": [ln for ln in listing if ln[:1] in ("-", "U")],
-        }
-    return result
+        raise GitOpsError((proc.stderr or proc.stdout).strip()
+                          or f"git {command[0]} failed after fetch")
+    final = _porcelain(top)
+    new = (final["oid"] or _ok(top, "rev-parse", "HEAD").strip())[:7]
+    return {"path": top, "branch": state["branch"], "pulled": behind, "old": old, "new": new,
+            "ahead": final["ahead"] or 0, "behind": final["behind"] or 0,
+            "submodules": _sync_submodules(top) if submodules else None}
+
+
+def pull_many(roots: list[str], cwd: str, mode: str = "ff", submodules: bool = True) -> dict:
+    """Pull every repo under the roots, parents before their submodules."""
+    listing = scan(roots, 6, True)["repos"]
+    mains = {r["path"] for r in listing if r["kind"] == "main"}
+    subs = {r["path"] for r in listing if r["kind"] == "submodule"}
+    order = sorted(mains) + sorted(subs)  # a submodule pull can collide with its parent's update
+    results: list[dict[str, Any]] = []
+    for path in order:
+        entry: dict[str, Any] = {"kind": "submodule" if path in subs else "main"}
+        try:
+            entry.update(pull(path, cwd, mode, submodules))
+        except GitOpsError as exc:
+            entry.update({"path": path, "error": str(exc)})
+        results.append(entry)
+    failed = [r for r in results if "error" in r]
+    state = "failed" if failed and len(failed) == len(results) else "partial" if failed else "ok"
+    return {"status": state, "scanned": len(results), "results": results}
 
 
 def envelope(fn, *args, **kwargs) -> str:

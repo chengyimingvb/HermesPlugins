@@ -1,6 +1,6 @@
 name: git-ops
-version: 0.2.0
-description: "Deterministic git tools: discover every repo under a root (submodules included), inspect status, generate a Conventional Commits message from the diff, commit explicit paths, push with proof, and fast-forward pull with submodule sync."
+version: 0.3.0
+description: "Deterministic git tools: discover every repo under a root (submodules included) with a one-call state probe, read status/diff/log, generate a Conventional Commits message from the diff, commit explicit paths, push with proof, fast-forward pull with submodule sync, and discard tracked work-tree changes."
 author: as850
 kind: standalone
 platforms:
@@ -10,7 +10,10 @@ platforms:
 provides_tools:
   - git_repos
   - git_status
+  - git_diff
+  - git_log
   - git_commit_info
   - git_commit
   - git_push
   - git_pull
+  - git_discard

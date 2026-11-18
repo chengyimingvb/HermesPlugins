@@ -2,6 +2,9 @@
 
 Thin HTTP shell over the plugin's own ``gitops.py`` — one implementation, two doors
 (agent tools and this UI). Every route answers ``{"ok": bool, "data"|"error": ...}``.
+
+Mutating work (commit / push / pull / discard / launching TortoiseGit) is POST only: a
+GET has to stay safe to prefetch, or a link preview can create a commit or pop a window.
 """
 
 from __future__ import annotations
@@ -51,7 +54,18 @@ def _envelope(fn, *args, **kwargs) -> dict[str, Any]:
 
 
 def _base(cwd: str | None) -> str:
-    return cwd or os.path.expanduser("~")
+    """The UI always sends its workspace; without one, act on the server's own cwd (never $HOME)."""
+    return cwd or os.getcwd()
+
+
+def _inside(top: str, path: str) -> str:
+    """An absolute target inside ``top``, or a GitOpsError — one guard for every route."""
+    if not path:
+        raise gitops.GitOpsError("path is required")
+    target = os.path.normpath(os.path.join(top, path))
+    if os.path.commonpath([os.path.normcase(top), os.path.normcase(target)]) != os.path.normcase(top):
+        raise gitops.GitOpsError(f"path escapes the repository: {path}")
+    return target
 
 
 @router.get("/repos")
@@ -70,9 +84,8 @@ def status(repo: str = Query("."), cwd: str = Query("")) -> dict[str, Any]:
 @router.get("/diff")
 def diff(repo: str = Query("."), path: str = Query(""), cwd: str = Query("")) -> dict[str, Any]:
     def _one() -> dict[str, Any]:
-        if not path:
-            raise gitops.GitOpsError("path is required")
         top = gitops.resolve_repo(repo, _base(cwd))
+        _inside(top, path)
         text, _files, truncated = gitops._diff(top, [path])
         if not text.strip():
             raise gitops.GitOpsError(f"no diff for {path} (unchanged, or binary)")
@@ -92,15 +105,7 @@ def commit(payload: dict = Body(...)) -> dict[str, Any]:
     repo = payload.get("repo") or "."
     paths = payload.get("paths") or []
     message = payload.get("message") or ""
-    cwd = _base(payload.get("cwd"))
-    if message.strip():
-        return _envelope(gitops.commit, repo, paths, message, cwd)
-    return _envelope(_auto_commit, repo, paths, cwd)
-
-
-def _auto_commit(repo: str, paths: list[str], cwd: str) -> dict[str, Any]:
-    message = gitops.commit_info(repo, paths, cwd, _llm())["message"]
-    return gitops.commit(repo, paths, message, cwd)
+    return _envelope(gitops.auto_commit, repo, paths, message, _base(payload.get("cwd")), _llm())
 
 
 @router.post("/push")
@@ -114,23 +119,15 @@ def pull(payload: dict = Body(...)) -> dict[str, Any]:
     submodules = bool(payload.get("submodules", True))
     cwd = _base(payload.get("cwd"))
     if payload.get("roots"):
-        return _envelope(_pull_many, payload["roots"], cwd, mode, submodules)
+        return _envelope(gitops.pull_many, payload["roots"], cwd, mode, submodules)
     return _envelope(gitops.pull, payload.get("repo") or ".", cwd, mode, submodules)
 
 
-def _pull_many(roots: list[str], cwd: str, mode: str, submodules: bool) -> dict[str, Any]:
-    listing = gitops.scan(roots, 6, True)["repos"]
-    order = ([r["path"] for r in listing if r["kind"] == "main"]
-             + [r["path"] for r in listing if r["kind"] == "submodule"])
-    results = []
-    for path in order:
-        try:
-            results.append(gitops.pull(path, cwd, mode, submodules))
-        except gitops.GitOpsError as exc:
-            results.append({"path": path, "error": str(exc)})
-    failed = [r for r in results if "error" in r]
-    state = "failed" if failed and len(failed) == len(results) else "partial" if failed else "ok"
-    return {"status": state, "scanned": len(results), "results": results}
+@router.post("/discard")
+def discard(payload: dict = Body(...)) -> dict[str, Any]:
+    """Throw away work-tree changes for the selected tracked paths (UI asks first)."""
+    return _envelope(gitops.discard, payload.get("repo") or ".", payload.get("paths") or [],
+                     _base(payload.get("cwd")))
 
 # ── TortoiseGit bridge ───────────────────────────────────────────────────
 # The desktop half can only hand the OS a URL (``ctx.os.openExternal`` admits web
@@ -164,12 +161,8 @@ def launch_tgit_diff(repo: str, path: str, cwd: str) -> dict[str, Any]:
     """Open TortoiseGit's diff window for one tracked working-tree file."""
     if os.name != "nt":
         raise gitops.GitOpsError("TortoiseGit is a Windows-only client")
-    if not path:
-        raise gitops.GitOpsError("path is required")
     top = gitops.resolve_repo(repo, cwd)
-    target = os.path.normpath(os.path.join(top, path))
-    if os.path.commonpath([os.path.normcase(top), os.path.normcase(target)]) != os.path.normcase(top):
-        raise gitops.GitOpsError(f"path escapes the repository: {path}")
+    target = _inside(top, path)
     if not os.path.exists(target):
         raise gitops.GitOpsError(f"no such file on disk: {path}")
     if gitops._run(["ls-files", "--error-unmatch", "--", path], cwd=top, timeout=20).returncode != 0:
@@ -179,8 +172,8 @@ def launch_tgit_diff(repo: str, path: str, cwd: str) -> dict[str, Any]:
     return {"launched": True, "exe": exe, "path": target}
 
 
-@router.get("/tgit")
-def tgit(repo: str = Query("."), path: str = Query(""), cwd: str = Query("")) -> dict[str, Any]:
+@router.post("/tgit")
+def tgit(payload: dict = Body(...)) -> dict[str, Any]:
     """Launch TortoiseGit's diff window. Any error here means the UI falls back to ``/diff``."""
-    return _envelope(launch_tgit_diff, repo, path, _base(cwd))
-
+    return _envelope(launch_tgit_diff, payload.get("repo") or ".", payload.get("path") or "",
+                     _base(payload.get("cwd")))
