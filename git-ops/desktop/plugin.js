@@ -166,6 +166,20 @@ function GitPane() {
     }
   }, [repo, base])
 
+  // The row opens TortoiseGit's own diff window; the in-pane dialog is the fallback
+  // (no TortoiseGit, untracked/binary file, or a path TortoiseGit refuses).
+  const openItem = useCallback(async (path) => {
+    if (!repo) return
+    try {
+      await api(`/tgit?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`
+        + `&cwd=${encodeURIComponent(base || repo)}`)
+      return
+    } catch (err) {
+      console.warn('[git-ops] tortoisegit unavailable:', err.message)
+    }
+    await openDiff(path)
+  }, [repo, base, openDiff])
+
   const run = useCallback(async (kind, path, body, describe, notify = false) => {
     setBusy(kind)
     try {
@@ -279,8 +293,8 @@ function GitPane() {
                 }),
                 jsx('span', {
                   className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
-                  title: '点击查看 diff',
-                  onClick: () => void openDiff(f.path),
+                  title: '点击用 TortoiseGit 查看 diff（不可用时内置视图）',
+                  onClick: () => void openItem(f.path),
                   children: [
                     jsx('span', { style: { ...MONO, ...MUTED }, children: f.code }),
                     jsx('span', { className: 'truncate', children: f.path })

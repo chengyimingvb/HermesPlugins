@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -129,3 +131,56 @@ def _pull_many(roots: list[str], cwd: str, mode: str, submodules: bool) -> dict[
     failed = [r for r in results if "error" in r]
     state = "failed" if failed and len(failed) == len(results) else "partial" if failed else "ok"
     return {"status": state, "scanned": len(results), "results": results}
+
+# ── TortoiseGit bridge ───────────────────────────────────────────────────
+# The desktop half can only hand the OS a URL (``ctx.os.openExternal`` admits web
+# schemes), so opening TortoiseGit's own diff window has to happen here: this
+# backend runs in the plugin-host process and can spawn a GUI child.
+
+
+def _tgit_exe() -> str:
+    """TortoiseGitProc.exe from PATH, else its default install locations."""
+    found = shutil.which("TortoiseGitProc.exe")
+    if found:
+        return found
+    for root in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+        if not root:
+            continue
+        candidate = os.path.join(root, "TortoiseGit", "bin", "TortoiseGitProc.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    raise gitops.GitOpsError("TortoiseGit not installed (TortoiseGitProc.exe not found)")
+
+
+def _spawn_tgit_diff(exe: str, target: str) -> None:
+    """Fire and forget: TortoiseGitProc owns its window and returns at once."""
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen([exe, "/command:diff", f"/path:{target}", "/closeonend:0"],
+                     close_fds=True, creationflags=flags)
+
+
+def launch_tgit_diff(repo: str, path: str, cwd: str) -> dict[str, Any]:
+    """Open TortoiseGit's diff window for one tracked working-tree file."""
+    if os.name != "nt":
+        raise gitops.GitOpsError("TortoiseGit is a Windows-only client")
+    if not path:
+        raise gitops.GitOpsError("path is required")
+    top = gitops.resolve_repo(repo, cwd)
+    target = os.path.normpath(os.path.join(top, path))
+    if os.path.commonpath([os.path.normcase(top), os.path.normcase(target)]) != os.path.normcase(top):
+        raise gitops.GitOpsError(f"path escapes the repository: {path}")
+    if not os.path.exists(target):
+        raise gitops.GitOpsError(f"no such file on disk: {path}")
+    if gitops._run(["ls-files", "--error-unmatch", "--", path], cwd=top, timeout=20).returncode != 0:
+        raise gitops.GitOpsError(f"untracked file, no diff to show: {path}")
+    exe = _tgit_exe()
+    _spawn_tgit_diff(exe, target)
+    return {"launched": True, "exe": exe, "path": target}
+
+
+@router.get("/tgit")
+def tgit(repo: str = Query("."), path: str = Query(""), cwd: str = Query("")) -> dict[str, Any]:
+    """Launch TortoiseGit's diff window. Any error here means the UI falls back to ``/diff``."""
+    return _envelope(launch_tgit_diff, repo, path, _base(cwd))
+

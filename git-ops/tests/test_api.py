@@ -87,6 +87,50 @@ def main() -> int:
         r = client.post("/api/plugins/git-ops/commit",
                         json={"repo": ".", "paths": ["missing.txt"], "cwd": work}).json()
         check("POST /commit rejects bad path", r.get("ok") is False and "not present" in r["error"], r)
+
+        # TortoiseGit bridge: stub the process so no GUI window opens during the test.
+        calls = []
+        real_subprocess, real_exe = api.subprocess, api._tgit_exe
+
+        class FakePopen:
+            def __init__(self, args, **kwargs):
+                calls.append(list(args))
+
+        class FakeSubprocess:
+            # Only the api module's binding is shadowed: gitops keeps the real
+            # module, so its own git subprocesses still run.
+            Popen = FakePopen
+            DETACHED_PROCESS = getattr(real_subprocess, "DETACHED_PROCESS", 0)
+            CREATE_NEW_PROCESS_GROUP = getattr(real_subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        api.subprocess = FakeSubprocess
+        api._tgit_exe = lambda: r"C:\Program Files\TortoiseGit\bin\TortoiseGitProc.exe"
+        try:
+            r = client.get("/api/plugins/git-ops/tgit",
+                           params={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+            check("GET /tgit launches", r.get("ok") and r["data"]["launched"], r)
+            args = calls[0] if calls else []
+            check("GET /tgit asks for /command:diff with an absolute path",
+                  len(args) == 4 and args[1] == "/command:diff" and args[2].startswith("/path:")
+                  and args[2].lower().replace("\\", "/").endswith("readme.txt"), args)
+
+            fx.write(fx.work, "tgit-untracked.txt", "x\n")
+            r = client.get("/api/plugins/git-ops/tgit",
+                           params={"repo": ".", "path": "tgit-untracked.txt", "cwd": work}).json()
+            check("GET /tgit refuses untracked", r.get("ok") is False and "untracked" in r["error"], r)
+
+            r = client.get("/api/plugins/git-ops/tgit",
+                           params={"repo": ".", "path": "../escape.txt", "cwd": work}).json()
+            check("GET /tgit refuses a path outside the repo",
+                  r.get("ok") is False and "escapes" in r["error"], r)
+
+            api._tgit_exe = lambda: (_ for _ in ()).throw(api.gitops.GitOpsError("not installed"))
+            r = client.get("/api/plugins/git-ops/tgit",
+                           params={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+            check("GET /tgit reports a missing TortoiseGit", r.get("ok") is False
+                  and "not installed" in r["error"], r)
+        finally:
+            api.subprocess, api._tgit_exe = real_subprocess, real_exe
     finally:
         fx.close()
     print(f"\nSUMMARY: {len(failures)} failed")
