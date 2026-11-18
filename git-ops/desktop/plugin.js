@@ -141,7 +141,10 @@ function FileList({ files, picked, onPick, onOpen }) {
   }
   return jsx('div', {
     ref,
-    onScroll: (e) => { if (virtual) setView((v) => ({ ...v, top: e.currentTarget.scrollTop })) },
+    // Read scrollTop into a local BEFORE setView: React nulls e.currentTarget once the
+    // handler returns, and the functional updater may run later — dereferencing it there
+    // throws 'Cannot read properties of null (reading scrollTop)' and kills the pane.
+    onScroll: (e) => { if (virtual) { const st = e.currentTarget ? e.currentTarget.scrollTop : 0; setView((v) => (v.top === st ? v : { ...v, top: st })) } },
     className: 'min-h-0 flex-1 overflow-auto rounded border p-1',
     style: STROKE,
     children: jsx('div', {
@@ -175,11 +178,14 @@ function SearchList({ files }) {
     style: { height: ROW },
     title: path,
     onClick: () => copyPath(path),
-    children: jsx('span', { className: 'min-w-0 flex-1 truncate', style: MONO, children: path })
+    children: jsx('span', { className: 'min-w-0 flex-1 truncate', style: MONO, children: baseName(path) })
   }, path)
   return jsx('div', {
     ref,
-    onScroll: (e) => { if (virtual) setView((v) => ({ ...v, top: e.currentTarget.scrollTop })) },
+    // Read scrollTop into a local BEFORE setView: React nulls e.currentTarget once the
+    // handler returns, and the functional updater may run later — dereferencing it there
+    // throws 'Cannot read properties of null (reading scrollTop)' and kills the pane.
+    onScroll: (e) => { if (virtual) { const st = e.currentTarget ? e.currentTarget.scrollTop : 0; setView((v) => (v.top === st ? v : { ...v, top: st })) } },
     className: 'max-h-64 min-h-0 overflow-auto rounded border p-1',
     style: STROKE,
     children: total
@@ -493,8 +499,19 @@ function GitPane() {
                 style: STROKE
               })
             ] }),
-            jsxs('div', { className: 'text-xs', style: MUTED,
-              children: `共 ${fileList.length} 个文件，匹配 ${visibleFiles.length}` }),
+            jsxs('div', { className: 'flex items-center justify-between px-0.5', children: [
+              jsx('span', { className: 'text-xs', style: MUTED,
+                children: `共 ${fileList.length} 个文件，匹配 ${visibleFiles.length}` }),
+              jsx('button', {
+                type: 'button',
+                onClick: () => { setSearchTerm(''); setSearchSuffix('') },
+                disabled: !searchTerm && !searchSuffix,
+                className: 'rounded px-1 py-0.5 text-xs hover:bg-[var(--ui-row-active-background)] disabled:opacity-40',
+                style: MUTED,
+                title: '清除过滤条件',
+                children: '清除'
+              })
+            ] }),
             jsx(SearchList, { files: visibleFiles })
           ] })
         : null,
