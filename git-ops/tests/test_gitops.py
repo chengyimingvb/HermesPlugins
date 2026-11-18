@@ -173,6 +173,15 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(run("rev-parse", "HEAD", cwd=self.fx.work).stdout.strip(),
                          run("rev-parse", "@{u}", cwd=self.fx.work).stdout.strip())
 
+    def test_commit_staged_deletion(self):
+        """已 staged 的删除也要能提交：git add 对不存在于工作区的路径会 fatal。"""
+        self.fx.write(self.fx.work, "gone.txt", "g\n")
+        gitops.commit(".", ["gone.txt"], "feat: 增加 gone 文件", str(self.fx.work))
+        run("rm", "-q", "gone.txt", cwd=self.fx.work)  # 删除已在索引中（等价 git rm）
+        result = gitops.commit(".", ["gone.txt"], "chore: 删除 gone 文件", str(self.fx.work))
+        self.assertEqual(result["files"], ["gone.txt"])
+        self.assertEqual(run("ls-files", "--", "gone.txt", cwd=self.fx.work).stdout.strip(), "")
+
     def test_pull_ff_and_diverged(self):
         consumer = self.fx._clone(self.fx.origin, "consumer")
         self.fx.write(self.fx.work, "c.txt", "c\n")

@@ -255,12 +255,17 @@ def validate_message(message: str) -> Optional[str]:
 
 # ── commit ───────────────────────────────────────────────────────────────
 
+def _indexed(top: str) -> set[str]:
+    """Paths in the index. A staged deletion is absent here but still known to git."""
+    return set(p for p in _run(["ls-files", "-z"], cwd=top).stdout.split("\0") if p)
+
+
 def check_paths(top: str, paths: list[str]) -> None:
     if not paths:
         raise GitOpsError("paths is required: stage explicit paths (no 'add -A')")
     if any(p in ("-A", "--all", ".", "-u") for p in paths):
         raise GitOpsError("refusing sweeping pathspecs; pass explicit file paths")
-    tracked = set(p for p in _run(["ls-files", "-z"], cwd=top).stdout.split("\0") if p)
+    tracked = _indexed(top)
     # A staged deletion is already out of the index, so "known to git" must include status paths.
     tracked.update(p for entry in _dirty(top)
                    for p in (entry["path"], entry.get("from", "")) if p)
@@ -272,7 +277,13 @@ def check_paths(top: str, paths: list[str]) -> None:
 
 def _stage(top: str, paths: list[str]) -> list[str]:
     check_paths(top, paths)
-    _ok(top, "add", "--", *paths)
+    # A staged deletion exists neither in the work tree nor in the index, and `git add`
+    # fatals on such a pathspec ('did not match any files'). The deletion is already
+    # staged, so leave it out of the add instead of failing the whole commit.
+    indexed = _indexed(top)
+    addable = [p for p in paths if p in indexed or os.path.exists(os.path.join(top, p))]
+    if addable:
+        _ok(top, "add", "--", *addable)
     staged = _run(["diff", "--cached", "--name-only", "-z"], cwd=top).stdout.split("\0")
     return [p for p in staged if p]
 
