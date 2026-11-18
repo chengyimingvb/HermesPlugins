@@ -166,6 +166,27 @@ class GitOpsTests(unittest.TestCase):
         self.assertNotIn("rev-list", calls)
         self.assertLessEqual(len(calls), 4, calls)
 
+    def test_list_files_respects_gitignore(self):
+        self.fx.write(self.fx.work, "tracked.py", "t\n")
+        gitops.commit(".", ["tracked.py"], "feat: 增加 tracked 文件", str(self.fx.work))
+        self.fx.write(self.fx.work, "untracked.md", "u\n")
+        self.fx.write(self.fx.work, "my file.txt", "spaced\n")
+        self.fx.write(self.fx.work, ".gitignore", "*.log\nignored.tmp\n")
+        self.fx.write(self.fx.work, "ignored.tmp", "x\n")
+        listing = gitops.list_files(".", str(self.fx.work))
+        files = set(listing["files"])
+        self.assertIn("tracked.py", files)
+        self.assertIn("untracked.md", files)
+        self.assertIn("my file.txt", files)   # -z keeps the space as one path
+        self.assertNotIn("ignored.tmp", files)
+        tracked_only = gitops.list_files(".", str(self.fx.work), include_untracked=False)
+        self.assertIn("tracked.py", tracked_only["files"])
+        self.assertNotIn("untracked.md", tracked_only["files"])
+        for name in ("untracked.md", "my file.txt", "ignored.tmp", ".gitignore"):
+            p = self.fx.work / name
+            if p.exists():
+                p.unlink()
+
     def test_scan_finds_submodule(self):
         listing = gitops.scan([str(self.fx.root)], 6, True)
         kinds = {Path(r["path"]).name: r["kind"] for r in listing["repos"]}

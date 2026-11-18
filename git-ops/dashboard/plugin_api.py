@@ -81,6 +81,13 @@ def status(repo: str = Query("."), cwd: str = Query("")) -> dict[str, Any]:
     return _envelope(gitops.status, repo, _base(cwd))
 
 
+@router.get("/files")
+def files(repo: str = Query("."), include_untracked: bool = Query(True),
+          cwd: str = Query("")) -> dict[str, Any]:
+    """Every non-ignored file in the repo, as paths relative to its root (read-only)."""
+    return _envelope(gitops.list_files, repo, _base(cwd), include_untracked)
+
+
 @router.get("/diff")
 def diff(repo: str = Query("."), path: str = Query(""), cwd: str = Query("")) -> dict[str, Any]:
     def _one() -> dict[str, Any]:

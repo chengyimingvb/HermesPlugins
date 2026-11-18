@@ -27,6 +27,33 @@ const MUTED = { color: 'var(--ui-text-tertiary)' }
 const STROKE = { borderColor: 'var(--ui-stroke-secondary)' }
 const MONO = { fontFamily: 'var(--font-mono, ui-monospace)' }
 
+function fallbackCopy(text) {
+  // navigator.clipboard can be blocked outside a secure context; execCommand is the
+  // webview-safe fallback.
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    ta.setSelectionRange(0, text.length)
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch (err) { return false }
+}
+
+function copyPath(path) {
+  // Silent: the row itself is the affordance, no toast on success or failure.
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(path).catch(() => fallbackCopy(path))
+  } else {
+    fallbackCopy(path)
+  }
+}
+
 // Workspace rows get a status-driven text color from the porcelain-v2 XY code
 // backend sends (X=index, Y=worktree; whole tokens ?? untracked, !! ignored).
 // Checked by severity so a rename-with-edit or staged-delete reads as the more
@@ -127,6 +154,46 @@ function FileList({ files, picked, onPick, onOpen }) {
   })
 }
 
+// Windowed the same way FileList does: past VIRTUAL_AFTER entries, only the visible
+// window sits in the DOM, driven by scroll position.
+function SearchList({ files }) {
+  const ref = useRef(null)
+  const [view, setView] = useState({ top: 0, height: 320 })
+  useEffect(() => {
+    const el = ref.current
+    if (!el || typeof ResizeObserver === 'undefined') return undefined
+    const ro = new ResizeObserver(() => setView((v) => ({ ...v, height: el.clientHeight || 320 })))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  const total = files.length
+  const virtual = total > VIRTUAL_AFTER
+  const start = virtual ? Math.max(0, Math.floor(view.top / ROW) - 6) : 0
+  const end = virtual ? Math.min(total, Math.ceil((view.top + view.height) / ROW) + 6) : total
+  const renderRow = (path) => jsx('div', {
+    className: 'flex min-w-0 cursor-pointer items-center gap-1 rounded px-1 text-xs hover:bg-[var(--ui-row-active-background)]',
+    style: { height: ROW },
+    title: path,
+    onClick: () => copyPath(path),
+    children: jsx('span', { className: 'min-w-0 flex-1 truncate', style: MONO, children: path })
+  }, path)
+  return jsx('div', {
+    ref,
+    onScroll: (e) => { if (virtual) setView((v) => ({ ...v, top: e.currentTarget.scrollTop })) },
+    className: 'max-h-64 min-h-0 overflow-auto rounded border p-1',
+    style: STROKE,
+    children: total
+      ? jsx('div', {
+          style: virtual ? { position: 'relative', height: total * ROW } : undefined,
+          children: jsx('div', {
+            style: virtual ? { position: 'absolute', top: start * ROW, left: 0, right: 0 } : undefined,
+            children: files.slice(start, end).map(renderRow)
+          })
+        })
+      : jsx('div', { className: 'p-1', style: MUTED, children: '没有匹配的文件' })
+  })
+}
+
 function GitPane() {
   const cwd = useValue(host.state.cwd)
   // Sessions switch within one workspace without moving cwd, and host.state.cwd tracks the
@@ -143,6 +210,13 @@ function GitPane() {
   const [busy, setBusy] = useState('')
   const [diff, setDiff] = useState(null)
   const [confirmDiscard, setConfirmDiscard] = useState(false)
+  // File search: list fetched once per repo, filtered in the client.
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchTerm, setSearchTerm] = useState('')
+  const [searchSuffix, setSearchSuffix] = useState('')
+  const [fileList, setFileList] = useState([])
+  const [fileBusy, setFileBusy] = useState(false)
+  const fileCache = useRef(new Map())
   // Workspace of the focused chat (falls back to the window cwd) — what the pane acts on.
   const [workspace, setWorkspace] = useState('')
   const base = workspace || cwd
@@ -239,6 +313,30 @@ function GitPane() {
     })()
     return () => { cancelled = true }
   }, [cwd, sessionKey, sessionId, scan, base, repos.length])
+
+  const loadFiles = useCallback(async (target) => {
+    if (!target) return
+    const cached = fileCache.current.get(target)
+    if (cached) { setFileList(cached); return }
+    setFileBusy(true)
+    try {
+      const data = await api(`/files?repo=${enc(target)}&cwd=${enc(base || target)}`)
+      const paths = (data.files || []).sort()
+      fileCache.current.set(target, paths)
+      setFileList(paths)
+    } catch (err) {
+      toast('加载文件列表失败: ' + err.message, 'error')
+      setFileList([])
+    } finally {
+      setFileBusy(false)
+    }
+  }, [base, toast])
+
+  // Open the search (or switch repo) → fetch that repo's list once; the cache makes a
+  // close/reopen instant.
+  useEffect(() => {
+    if (searchOpen && repo) void loadFiles(repo)
+  }, [searchOpen, repo, loadFiles])
 
   // The agent commits in the same repo from its own tool calls; without a poll the pane
   // would keep showing a stale file list until the user hit 刷新.
@@ -338,13 +436,37 @@ function GitPane() {
   const disabled = !repoReady || Boolean(busy)
   const allPicked = files.length > 0 && picked.length === files.length
   const repoLabel = useMemo(() => (repo ? baseName(repo) : ''), [repo])
+  // Client-side search filter: term matches anywhere in the repo-relative path,
+  // suffix matches the bytes after the last dot ('.py' and '*.py' both accepted).
+  const visibleFiles = useMemo(() => {
+    const term = searchTerm.trim().toLowerCase()
+    const suffix = searchSuffix.trim().replace(/^\*/, '').replace(/^\./, '').toLowerCase()
+    return fileList.filter((p) => {
+      if (term && !p.toLowerCase().includes(term)) return false
+      if (suffix) {
+        const dot = p.lastIndexOf('.')
+        if (dot < 0 || p.slice(dot + 1).toLowerCase() !== suffix) return false
+      }
+      return true
+    })
+  }, [fileList, searchTerm, searchSuffix])
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-2 overflow-hidden p-3 text-sm',
     children: [
       jsxs(Row, {
         children: [
-          jsx('span', { className: 'flex-1 text-xs', style: MUTED, children: '仓库' }),
+          jsx('button', {
+            type: 'button',
+            onClick: () => setSearchOpen((o) => !o),
+            className: 'flex min-w-0 flex-1 items-center gap-1 rounded px-1 py-0.5 text-left text-xs',
+            title: searchOpen ? '收起文件搜索' : '展开文件搜索',
+            children: [
+              jsx('span', { className: 'shrink-0', style: MUTED, children: searchOpen ? '▾' : '▸' }),
+              jsx('span', { style: MUTED, children: '文件搜索' }),
+              fileBusy ? jsx('span', { style: MUTED, children: ' …' }) : null
+            ]
+          }),
           jsx(Button, {
             size: 'sm', variant: 'secondary',
             onClick: () => scan(base),
@@ -353,6 +475,29 @@ function GitPane() {
           })
         ]
       }),
+      searchOpen
+        ? jsxs('div', { className: 'shrink-0 flex flex-col gap-1 px-0.5 pb-1', children: [
+            jsxs('div', { className: 'grid grid-cols-2 gap-1', children: [
+              jsx('input', {
+                value: searchTerm,
+                onChange: (e) => setSearchTerm(e.target.value),
+                placeholder: '文件名关键词',
+                className: 'rounded border px-1.5 py-0.5 text-xs',
+                style: STROKE
+              }),
+              jsx('input', {
+                value: searchSuffix,
+                onChange: (e) => setSearchSuffix(e.target.value),
+                placeholder: '后缀，如 .py',
+                className: 'rounded border px-1.5 py-0.5 text-xs',
+                style: STROKE
+              })
+            ] }),
+            jsxs('div', { className: 'text-xs', style: MUTED,
+              children: `共 ${fileList.length} 个文件，匹配 ${visibleFiles.length}` }),
+            jsx(SearchList, { files: visibleFiles })
+          ] })
+        : null,
       jsx('div', {
         className: 'max-h-28 shrink-0 overflow-auto rounded border',
         style: { ...STROKE, background: 'var(--ui-bg-tertiary)' },

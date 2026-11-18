@@ -62,6 +62,15 @@ def main() -> int:
         r = client.get(f"{BASE}/status", params={"repo": ".", "cwd": ""}).json()
         check("GET /status without cwd does not scan $HOME", r.get("ok") is False or r["data"]["path"], r)
 
+        r = client.get(f"{BASE}/files", params={"repo": ".", "cwd": work}).json()
+        check("GET /files ok", r.get("ok") and r["data"]["count"] >= 1, r)
+        fx.write(fx.work, "ignored-by-api.tmp", "x\n")
+        r = client.get(f"{BASE}/files", params={"repo": ".", "cwd": work,
+                                                "include_untracked": "false"}).json()
+        check("GET /files include_untracked=false drops untracked",
+              r.get("ok") and "ignored-by-api.tmp" not in r["data"]["files"], r)
+        (fx.work / "ignored-by-api.tmp").unlink()
+
         fx.write(fx.work, "api.txt", "x\n")
         r = client.get(f"{BASE}/diff", params={"repo": ".", "path": "api.txt", "cwd": work}).json()
         check("GET /diff (new file)", r.get("ok") and "api.txt" in r["data"]["diff"], r)

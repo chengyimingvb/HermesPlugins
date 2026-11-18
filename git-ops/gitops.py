@@ -563,6 +563,23 @@ def log(repo: str, limit: int = 20, cwd: str = ".") -> dict:
     return {"path": top, "count": len(commits), "commits": commits}
 
 
+def list_files(repo: str, cwd: str, include_untracked: bool = True) -> dict:
+    """Every non-ignored file in the work tree, as paths relative to the repo root.
+
+    Ignore filtering is git's own job: tracked files can never be ignored, and
+    ``--exclude-standard`` applies .gitignore (plus core.excludesfile and
+    $GIT_DIR/info/exclude) to the untracked set. ``-z`` keeps a path with spaces
+    whole, matching the rest of this module.
+    """
+    top = resolve_repo(repo, cwd)
+    tracked = [p for p in _run(["ls-files", "-z"], cwd=top, timeout=60).stdout.split("\0") if p]
+    if include_untracked:
+        untracked = [p for p in _run(["ls-files", "--others", "--exclude-standard", "-z"],
+                                     cwd=top, timeout=60).stdout.split("\0") if p]
+        tracked += [p for p in untracked if p not in tracked]
+    return {"path": top, "count": len(tracked), "files": tracked}
+
+
 def discard(repo: str, paths: list[str], cwd: str) -> dict:
     """Throw work-tree changes away for tracked paths (index and work tree back to HEAD).
 
