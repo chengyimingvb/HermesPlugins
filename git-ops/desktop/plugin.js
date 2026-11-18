@@ -10,6 +10,8 @@ let rest = null
 const GET_TIMEOUT = 120000
 const POST_TIMEOUT = 180000
 const POLL_MS = 5000
+const MAX_POLL_MS = 60000
+const SEARCH_DEBOUNCE_MS = 150
 const ROW = 24
 const VIRTUAL_AFTER = 150
 
@@ -317,6 +319,12 @@ function GitPane() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
   const [searchSuffix, setSearchSuffix] = useState('')
+  // Debounced copies feed the flat file-list filter, so typing doesn't rescan a huge
+  // (e.g. Unity) tree on every keystroke; the inputs still reflect keystrokes instantly.
+  const [debTerm, setDebTerm] = useState('')
+  const [debSuffix, setDebSuffix] = useState('')
+  useEffect(() => { const id = setTimeout(() => setDebTerm(searchTerm), SEARCH_DEBOUNCE_MS); return () => clearTimeout(id) }, [searchTerm])
+  useEffect(() => { const id = setTimeout(() => setDebSuffix(searchSuffix), SEARCH_DEBOUNCE_MS); return () => clearTimeout(id) }, [searchSuffix])
   const [fileList, setFileList] = useState([])
   const [fileBusy, setFileBusy] = useState(false)
   const fileCache = useRef(new Map())
@@ -444,14 +452,36 @@ function GitPane() {
 
   // The agent commits in the same repo from its own tool calls; without a poll the pane
   // would keep showing a stale file list until the user hit 刷新.
+  // Chain the poll (no overlapping status calls), back off while nothing changes, and pause
+  // while the panel isn't on screen — a fixed 5s setInterval fired a git status every 5s on
+  // a clean repo behind a hidden pane.
   useEffect(() => {
     if (!repo || busy) return undefined
-    const id = setInterval(() => { void refresh(repo, base) }, POLL_MS)
-    return () => clearInterval(id)
+    let cancelled = false
+    let timer = null
+    let lastSig = ''
+    let delay = POLL_MS
+    const tick = async () => {
+      if (cancelled) return
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        timer = setTimeout(tick, POLL_MS)
+        return
+      }
+      const st = await refresh(repo, base)
+      // head + dirty count collapse thousands of paths to one comparison: an agent commit
+      // flips head and resets the cadence, a no-op poll doubles the gap up to MAX_POLL_MS.
+      const sig = st ? `${st.head || ''}|${(st.files || []).length}` : ''
+      if (st && sig === lastSig) delay = Math.min(delay * 2, MAX_POLL_MS)
+      else { delay = POLL_MS; if (st) lastSig = sig }
+      if (!cancelled) timer = setTimeout(tick, delay)
+    }
+    void tick()
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
   }, [repo, base, busy, refresh])
 
   const onPick = useCallback((path, on) => {
-    setPicked((prev) => (on ? [...new Set([...prev, path])] : prev.filter((p) => p !== path)))
+    // Avoid the double array copy + Set build on the hot path: an include-guard is enough.
+    setPicked((prev) => (on ? (prev.includes(path) ? prev : [...prev, path]) : prev.filter((p) => p !== path)))
   }, [])
 
   const openDiff = useCallback(async (path) => {
@@ -543,8 +573,8 @@ function GitPane() {
   // Client-side search filter: term matches anywhere in the repo-relative path,
   // suffix matches the bytes after the last dot ('.py' and '*.py' both accepted).
   const visibleFiles = useMemo(() => {
-    const term = searchTerm.trim().toLowerCase()
-    const suffix = searchSuffix.trim().replace(/^\*/, '').replace(/^\./, '').toLowerCase()
+    const term = debTerm.trim().toLowerCase()
+    const suffix = debSuffix.trim().replace(/^\*/, '').replace(/^\./, '').toLowerCase()
     return fileList.filter((p) => {
       if (term && !p.toLowerCase().includes(term)) return false
       if (suffix) {
@@ -553,7 +583,7 @@ function GitPane() {
       }
       return true
     })
-  }, [fileList, searchTerm, searchSuffix])
+  }, [fileList, debTerm, debSuffix])
 
   return jsxs('div', {
     className: 'flex h-full flex-col gap-2 overflow-hidden p-3 text-sm',
@@ -613,7 +643,7 @@ function GitPane() {
             jsx(SearchList, {
               all: fileList,
               files: visibleFiles,
-              filterActive: Boolean(searchTerm || searchSuffix)
+              filterActive: Boolean(debTerm || debSuffix)
             })
           ] })
         : null,

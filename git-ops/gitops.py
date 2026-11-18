@@ -41,6 +41,9 @@ SECRET_PATTERNS = (
 )
 # Tests and embedders point git at a sandboxed config without touching os.environ.
 ENV_OVERRIDES: dict[str, str] = {}
+# Absolute path -> toplevel cache. Keyed by normcase so drive-letter case drift folds back
+# to one spelling; a live .git check keeps a re-created repo from serving a stale answer.
+_TOPLEVEL_CACHE: dict[str, str] = {}
 
 
 class GitOpsError(Exception):
@@ -94,10 +97,17 @@ def _ok(repo: str, *args, timeout: int = 60) -> str:
 
 
 def toplevel(path: str) -> str:
+    key = os.path.normcase(os.path.normpath(path))
+    cached = _TOPLEVEL_CACHE.get(key)
+    if cached and (os.path.isdir(os.path.join(cached, ".git"))
+                   or os.path.isfile(os.path.join(cached, ".git"))):
+        return cached
     proc = _run(["rev-parse", "--show-toplevel"], cwd=path, timeout=20)
     if proc.returncode != 0:
         raise GitOpsError(f"not a git work tree: {path}")
-    return proc.stdout.strip().replace("\\", "/")
+    top = proc.stdout.strip().replace("\\", "/")
+    _TOPLEVEL_CACHE[key] = top
+    return top
 
 
 def _git_dir(top: str) -> Optional[Path]:
@@ -222,7 +232,7 @@ def resolve_repo(repo: Optional[str], cwd: str) -> str:
 
 # ── state ────────────────────────────────────────────────────────────────
 
-def _porcelain(top: str) -> dict:
+def _porcelain(top: str, untracked: bool = True) -> dict:
     """branch / upstream / ahead / behind / files from one ``status --porcelain=v2 -z`` run.
 
     Record shapes (NUL-terminated, so a path with spaces stays one path):
@@ -231,8 +241,10 @@ def _porcelain(top: str) -> dict:
       u <XY> ... <path>              unmerged
       ? <path> / ! <path>            untracked / ignored
     """
-    proc = _run(["status", "--porcelain=v2", "--branch", "-z"], cwd=top,
-                timeout=GIT_TIMEOUT["status"])
+    args = ["status", "--porcelain=v2", "--branch", "-z"]
+    if not untracked:
+        args.append("-uno")  # push/pull only need the branch header; skip the untracked walk
+    proc = _run(args, cwd=top, timeout=GIT_TIMEOUT["status"])
     if proc.returncode != 0:
         raise GitOpsError(proc.stderr.strip() or "git status failed")
     out = {"oid": "", "branch": "", "upstream": "", "ahead": None, "behind": None, "files": []}
@@ -282,7 +294,7 @@ def _dirty(top: str) -> list[dict]:
 
 
 def _light_state(top: str) -> dict:
-    state = _porcelain(top)
+    state = _porcelain(top, untracked=False)
     return {
         "branch": state["branch"] or "DETACHED",
         "upstream": state["upstream"],
@@ -311,7 +323,7 @@ def status(repo: str, cwd: str) -> dict:
     state = _porcelain(top)
     branch = state["branch"] or "DETACHED"
     gone = ""
-    if state["branch"]:
+    if state["branch"] and state["upstream"]:
         gone = _run(["for-each-ref", "--format=%(upstream:track)",
                      f"refs/heads/{branch}"], cwd=top, timeout=20).stdout.strip()
     return {"path": top, "branch": branch, "upstream": state["upstream"],
@@ -436,8 +448,9 @@ def commit(repo: str, paths: list[str], message: str, cwd: str) -> dict:
         _ok(top, "commit", "-F", handle.name, timeout=GIT_TIMEOUT["commit"])
     finally:
         os.unlink(handle.name)
-    sha = _ok(top, "rev-parse", "HEAD").strip()
-    header = _ok(top, "log", "-1", "--format=%s").strip()
+    # One call for short+subject instead of rev-parse + log.
+    meta = _ok(top, "log", "-1", "--format=%H%x1f%s").strip()
+    sha, _, header = meta.partition("\x1f")
     return {"path": top, "sha": sha, "short": sha[:8], "header": header, "files": staged}
 
 
@@ -669,7 +682,13 @@ def pull(repo: str, cwd: str, mode: str = "ff", submodules: bool = True) -> dict
         raise GitOpsError("detached HEAD: refuse to pull")
     if not state["upstream"]:
         raise GitOpsError("no upstream for this branch; set one with 'git branch -u <remote>/<branch>'")
-    fetch = _run(["fetch", "--all", "--prune", "--tags"], cwd=top, timeout=GIT_TIMEOUT["pull"])
+    remote = state["upstream"].split("/", 1)[0] if state["upstream"] else None
+    fetch = _run(["fetch", "--prune", "--tags", remote]
+                 if remote else ["fetch", "--all", "--prune", "--tags"],
+                 cwd=top, timeout=GIT_TIMEOUT["pull"])
+    if fetch.returncode != 0 and remote:
+        # A remote name containing a slash defeats the first-segment guess: fall back to all.
+        fetch = _run(["fetch", "--all", "--prune", "--tags"], cwd=top, timeout=GIT_TIMEOUT["pull"])
     if fetch.returncode != 0:
         raise GitOpsError((fetch.stderr or fetch.stdout).strip() or "git fetch failed")
     counts = _porcelain(top)
