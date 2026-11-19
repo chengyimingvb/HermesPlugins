@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -24,19 +25,44 @@ router = APIRouter()
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_gitops():
-    """Import the plugin's gitops module by path (the plugin dir name has a hyphen)."""
-    name = "hermes_gitops_core"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, PLUGIN_ROOT / "gitops.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+_CORE_LOCK = threading.Lock()
+_CORE_CACHE: dict[str, tuple[int, Any]] = {}
 
 
-gitops = _load_gitops()
+def _load_gitops(path: Path | None = None):
+    """Import gitops.py by path, re-executing it whenever the file changed on disk.
+
+    The plugin dir name carries a hyphen, so the core cannot be imported by name. Reloading
+    on an mtime change is what keeps the dashboard half live after a plugin update: this file
+    is imported ONCE, when its router mounts, so a cached import would pin the old core until
+    the gateway restarts.
+    """
+    path = Path(path or PLUGIN_ROOT / "gitops.py")
+    stamp = path.stat().st_mtime_ns
+    cached = _CORE_CACHE.get(str(path))
+    if cached and cached[0] == stamp:
+        return cached[1]
+    with _CORE_LOCK:
+        cached = _CORE_CACHE.get(str(path))
+        if cached and cached[0] == stamp:
+            return cached[1]
+        name = "hermes_gitops_core"
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        _CORE_CACHE[str(path)] = (stamp, module)
+        return module
+
+
+class _Core:
+    """Every attribute resolves through the newest gitops module on disk."""
+
+    def __getattr__(self, name):
+        return getattr(_load_gitops(), name)
+
+
+gitops = _Core()
 
 
 def _llm():

@@ -123,6 +123,14 @@ class GitOpsTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.fx.close()
 
+    def test_submodule_paths_keep_spaces(self):
+        """.gitmodules 里带空格的路径不能被 git config 输出拆开或加引号。"""
+        probe = self.fx.root / "paths-probe"
+        probe.mkdir()
+        (probe / ".gitmodules").write_text(
+            '[submodule "a"]\n\tpath = subs/my lib\n\turl = ../s.git\n', encoding="utf-8")
+        self.assertEqual(gitops._submodule_paths(str(probe)), ["subs/my lib"])
+
     def test_validate_message(self):
         ok = "feat(core): 增加跳过空引用的守卫"
         self.assertIsNone(gitops.validate_message(ok))
@@ -414,6 +422,35 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(result["files"], ["gone.txt"])
         self.assertEqual(run("ls-files", "--", "gone.txt", cwd=self.fx.work).stdout.strip(), "")
 
+    def test_pull_advances_detached_submodule_to_its_gitlink(self):
+        """detached 的子模块仍跟父级 gitlink 前进：修复不能削弱原来的建树语义。"""
+        consumer = self.fx._clone(self.fx.origin, "consumer-detached")
+        run("submodule", "update", "--init", "--recursive", cwd=consumer, env=self.fx.env)
+        lib = consumer / "subs/lib"
+        before = run("rev-parse", "HEAD", cwd=lib, env=self.fx.env).stdout.strip()
+
+        sub = self.fx.sub_work
+        self.fx.write(sub, "next.txt", "n\n")
+        run("add", "next.txt", cwd=sub, env=self.fx.env)
+        run("commit", "-m", "feat: 子模块新提交", cwd=sub, env=self.fx.env)
+        run("push", "origin", "HEAD", cwd=sub, env=self.fx.env)
+        target = run("rev-parse", "HEAD", cwd=sub, env=self.fx.env).stdout.strip()
+
+        work_lib = self.fx.work / "subs/lib"
+        run("fetch", "origin", cwd=work_lib, env=self.fx.env)
+        run("checkout", target, cwd=work_lib, env=self.fx.env)
+        run("add", "subs/lib", cwd=self.fx.work, env=self.fx.env)
+        run("commit", "-m", "chore: 提升子模块指针", cwd=self.fx.work, env=self.fx.env)
+        run("push", "origin", "HEAD", cwd=self.fx.work, env=self.fx.env)
+
+        result = gitops.pull(".", str(consumer))
+        self.assertNotEqual(before, target)
+        self.assertEqual(result["submodules"]["needs_attention"], [], result)
+        self.assertEqual(run("rev-parse", "HEAD", cwd=lib,
+                             env=self.fx.env).stdout.strip(), target)
+        self.assertEqual(run("symbolic-ref", "-q", "--short", "HEAD", cwd=lib,
+                             env=self.fx.env, check=False).returncode, 1)  # 仍然 detached
+
     def test_pull_ff_and_diverged(self):
         consumer = self.fx._clone(self.fx.origin, "consumer")
         self.fx.write(self.fx.work, "c.txt", "c\n")
@@ -446,6 +483,29 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(result["pulled"], 0)
         self.assertIsNotNone(result["submodules"], result)
         self.assertEqual(result["submodules"]["needs_attention"], [])
+
+    def test_pull_keeps_submodule_on_its_branch(self):
+        """父仓库 pull 不能把在分支上的子模块 reset 到 gitlink：那会 detach 并藏掉它的提交。"""
+        consumer = self.fx._clone(self.fx.origin, "consumer-branch")
+        run("submodule", "update", "--init", "--recursive", cwd=consumer, env=self.fx.env)
+        lib = consumer / "subs/lib"
+        run("checkout", "-B", "main", cwd=lib, env=self.fx.env)
+        self.fx.write(lib, "wip.txt", "w\n")
+        run("add", "wip.txt", cwd=lib, env=self.fx.env)
+        run("commit", "-m", "feat: 子模块本地提交", cwd=lib, env=self.fx.env)
+        local = run("rev-parse", "HEAD", cwd=lib, env=self.fx.env).stdout.strip()
+
+        self.fx.write(self.fx.work, "after.txt", "a\n")
+        gitops.commit(".", ["after.txt"], "feat: 父仓库提交", str(self.fx.work))
+        gitops.push(".", str(self.fx.work))
+        result = gitops.pull(".", str(consumer))
+
+        self.assertGreaterEqual(result["pulled"], 1, result)
+        self.assertEqual(run("symbolic-ref", "--short", "HEAD", cwd=lib,
+                             env=self.fx.env).stdout.strip(), "main")
+        self.assertEqual(run("rev-parse", "HEAD", cwd=lib,
+                             env=self.fx.env).stdout.strip(), local)
+        self.assertIn("subs/lib", result["submodules"]["on_branch"], result)
 
     def test_commit_info_redacts_secrets(self):
         self.fx.write(self.fx.work, "secret.txt", "token = ghp_" + "a" * 30 + "\n")

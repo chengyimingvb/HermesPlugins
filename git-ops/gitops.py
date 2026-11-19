@@ -700,18 +700,58 @@ def push(repo: str, cwd: str) -> dict:
 
 # ── pull ─────────────────────────────────────────────────────────────────
 
+def _submodule_branches(top: str) -> dict[str, str]:
+    """Submodule path -> checked-out branch, or 'DETACHED'. One git call for the whole tree."""
+    proc = _run(["submodule", "foreach", "--quiet",
+                 'printf "%s|%s\\n" "$displaypath" "$(git symbolic-ref -q --short HEAD || echo DETACHED)"'],
+                cwd=top, timeout=GIT_TIMEOUT["pull"])
+    branches: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        path, _, branch = line.partition("|")
+        if path.strip():
+            branches[path.strip().replace("\\", "/")] = branch.strip() or "DETACHED"
+    return branches
+
+
+def _submodule_paths(top: str) -> list[str]:
+    """Every submodule path in .gitmodules (-z: git must not quote a path holding spaces)."""
+    proc = _run(["config", "-z", "--file", os.path.join(top, ".gitmodules"),
+                 "--get-regexp", r"^submodule\..*\.path$"], cwd=top,
+                timeout=GIT_TIMEOUT["pull"])
+    paths: list[str] = []
+    for entry in proc.stdout.split("\0"):
+        _, _, path = entry.strip().partition("\n")
+        if path:
+            paths.append(path.strip().replace("\\", "/"))
+    return paths
+
+
 def _sync_submodules(top: str) -> Optional[dict]:
+    """Sync submodule URLs, then check out only where there is no branch to lose.
+
+    ``git submodule update`` resets a submodule to the parent's recorded gitlink, which
+    detaches a submodule sitting on a branch and hides that branch's commits. So it runs
+    only for submodules that are not cloned yet and for detached ones; a submodule on a
+    branch is left alone and reported (``on_branch`` / ``needs_attention``).
+    """
     if not os.path.isfile(os.path.join(top, ".gitmodules")):
         return None
     _run(["submodule", "sync", "--recursive"], cwd=top, timeout=GIT_TIMEOUT["pull"])
-    sub = _run(["submodule", "update", "--init", "--recursive"], cwd=top,
-               timeout=GIT_TIMEOUT["pull"])
-    if sub.returncode != 0:
-        raise GitOpsError("pull landed but submodule update failed: "
-                          + (sub.stderr or sub.stdout).strip())
-    listing = _ok(top, "submodule", "status", "--recursive").strip().splitlines()
-    return {"count": len(listing),
-            "needs_attention": [ln for ln in listing if ln[:1] in ("-", "U")]}
+    branches = _submodule_branches(top)
+    targets = [p for p in _submodule_paths(top)
+               if branches.get(p) == "DETACHED"
+               or not os.path.exists(os.path.join(top, p, ".git"))]
+    if targets:
+        sub = _run(["submodule", "update", "--init", "--recursive", "--", *targets],
+                   cwd=top, timeout=GIT_TIMEOUT["pull"])
+        if sub.returncode != 0:
+            raise GitOpsError("pull landed but submodule update failed: "
+                              + (sub.stderr or sub.stdout).strip())
+    after = _ok(top, "submodule", "status", "--recursive").strip().splitlines()
+    return {"count": len(after),
+            # '+' = the submodule is ahead/behind its gitlink: expected on a kept branch.
+            "needs_attention": [ln for ln in after if ln[:1] in ("-", "U", "+")],
+            "on_branch": sorted(p for p, b in branches.items() if b != "DETACHED")}
 
 
 def pull(repo: str, cwd: str, mode: str = "ff", submodules: bool = True) -> dict:

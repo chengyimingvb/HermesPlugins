@@ -152,14 +152,17 @@ _TOOLS = [
     ("git_pull", {
         "name": "git_pull",
         "description": "Fetch, then fast-forward (default) or rebase the current branch, then sync "
-                       "and update submodules recursively. Diverged branches are refused, not merged.",
+                       "submodule URLs and initialise missing/detached submodules. A submodule "
+                       "checked out on a branch stays on it. Diverged branches are refused, not merged.",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO,
             "roots": {"type": "array", "items": {"type": "string"},
                       "description": "Batch mode: pull every repo found under these roots, "
                                      "one at a time, parents before their submodules."},
             "mode": {"type": "string", "enum": ["ff", "rebase"], "description": "Default 'ff'."},
-            "submodules": {"type": "boolean", "description": "Sync + update submodules (default true)."},
+            "submodules": {"type": "boolean",
+                                     "description": "Sync submodule URLs and init missing/detached ones; "
+                                                    "on-branch submodules are left alone (default true)."},
         }},
     }, "⬇️"),
     ("git_discard", {

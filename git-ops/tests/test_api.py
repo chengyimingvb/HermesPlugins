@@ -10,6 +10,7 @@ file cannot drift onto one machine's install layout.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -58,6 +59,17 @@ def main() -> int:
 
         r = client.get(f"{BASE}/status", params={"repo": ".", "cwd": work}).json()
         check("GET /status branch", r["ok"] and r["data"]["branch"] == "main", r)
+
+        # 面板拉取靠这一条：plugin_api.py 只在挂载时 import 一次，所以两次请求之间
+        # 修改 gitops.py 也必须生效，否则部署后仍跑旧代码直到 gateway 重启。
+        probe = fx.root / "core-probe"
+        probe.mkdir()
+        core = probe / "gitops.py"
+        core.write_text("VALUE = 'v1'\n", encoding="utf-8")
+        check("core reload v1", api._load_gitops(core).VALUE == "v1")
+        core.write_text("VALUE = 'v2'\n", encoding="utf-8")
+        os.utime(core, (1, 1))  # 保证 mtime 与第一次不同
+        check("core reload follows the file on disk", api._load_gitops(core).VALUE == "v2", core.stat().st_mtime_ns)
 
         r = client.get(f"{BASE}/status", params={"repo": ".", "cwd": ""}).json()
         check("GET /status without cwd does not scan $HOME", r.get("ok") is False or r["data"]["path"], r)
