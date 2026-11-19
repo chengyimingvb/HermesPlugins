@@ -64,6 +64,9 @@ def git_path() -> Optional[str]:
 
 GIT = git_path()
 
+# Windows-only: keep every git.exe from flashing a console window in the GUI host.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 def _env() -> dict:
     env = dict(os.environ)
@@ -84,7 +87,12 @@ def _run(args: list, cwd: Optional[str] = None, timeout: int = 60) -> subprocess
     cmd = [GIT, *(["-C", cwd] if cwd else []), *args]
     try:
         return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", timeout=timeout, env=_env())
+                              errors="replace", timeout=timeout, env=_env(),
+                              # CREATE_NO_WINDOW: git.exe is a console program and the plugin
+                              # host is a GUI process, so without it every call flashes a
+                              # console window. stdio on /dev/null: a credential helper that
+                              # still asks gets EOF instead of hanging out the full timeout.
+                              stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
     except subprocess.TimeoutExpired as exc:
         raise GitOpsError(f"git {args[0]} timed out after {timeout}s") from exc
 
@@ -376,11 +384,14 @@ def _guard_paths(paths: list[str]) -> None:
 
 
 def _known_paths(top: str) -> tuple[set[str], list[dict]]:
-    """Index contents plus every path status mentions (a staged deletion lives only there)."""
-    indexed = _indexed(top)
+    """Every path status mentions (both sides of a rename), from ONE status call.
+
+    An `ls-files` index dump is not needed: status already reports every staged, unstaged and
+    deleted path, and a tracked-but-unchanged path is never a commit target — `git add` on it
+    stages nothing, so it can only end in "nothing staged". One process instead of two.
+    """
     files = _dirty(top)
-    known = set(indexed) | {p for entry in files
-                            for p in (entry["path"], entry.get("from", "")) if p}
+    known = {p for entry in files for p in (entry["path"], entry.get("from", "")) if p}
     return known, files
 
 
@@ -609,14 +620,16 @@ def list_files(repo: str, cwd: str, include_untracked: bool = True) -> dict:
     ``--exclude-standard`` applies .gitignore (plus core.excludesfile and
     $GIT_DIR/info/exclude) to the untracked set. ``-z`` keeps a path with spaces
     whole, matching the rest of this module.
+
+    ``--cached`` and ``--others`` ride ONE invocation (tracked first, then untracked):
+    a second process here costs ~100ms on a 20k-file repo for no extra information.
     """
     top = resolve_repo(repo, cwd)
-    tracked = [p for p in _run(["ls-files", "-z"], cwd=top, timeout=60).stdout.split("\0") if p]
-    if include_untracked:
-        untracked = [p for p in _run(["ls-files", "--others", "--exclude-standard", "-z"],
-                                     cwd=top, timeout=60).stdout.split("\0") if p]
-        tracked += [p for p in untracked if p not in tracked]
-    return {"path": top, "count": len(tracked), "files": tracked}
+    args = ["ls-files", "-z", "--exclude-standard"]
+    args += ["--cached", "--others"] if include_untracked else ["--cached"]
+    files = list(dict.fromkeys(
+        p for p in _run(args, cwd=top, timeout=60).stdout.split("\0") if p))
+    return {"path": top, "count": len(files), "files": files}
 
 
 def discard(repo: str, paths: list[str], cwd: str) -> dict:

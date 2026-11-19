@@ -268,6 +268,70 @@ class GitOpsTests(unittest.TestCase):
         for args in seen:
             self.assertIn("-uno", args, args)
 
+    def test_commit_reuses_one_status_for_known_paths(self):
+        """commit 不再额外 dump 索引：known 路径全部来自那一次 status。"""
+        work = str(self.fx.work)
+        self.fx.write(self.fx.work, "kp.txt", "k\n")
+        calls = []
+        real = gitops._run
+
+        def spy(args, cwd=None, timeout=60):
+            calls.append(args[0])
+            return real(args, cwd, timeout)
+
+        gitops._run = spy
+        try:
+            result = gitops.commit(".", ["kp.txt"], "feat: 增加 kp 文件", work)
+        finally:
+            gitops._run = real
+        self.assertEqual(result["files"], ["kp.txt"])
+        self.assertNotIn("ls-files", calls, calls)
+        self.assertEqual(calls.count("status"), 1, calls)
+        self.assertLessEqual(len(calls), 6, calls)
+
+    def test_list_files_is_one_git_call(self):
+        """--cached 与 --others 同一次调用：20k 文件的仓库省一整次 ls-files。"""
+        self.fx.write(self.fx.work, "lf-untracked.txt", "u\n")
+        calls = []
+        real = gitops._run
+
+        def spy(args, cwd=None, timeout=60):
+            calls.append(args[0])
+            return real(args, cwd, timeout)
+
+        gitops._run = spy
+        try:
+            full = gitops.list_files(".", str(self.fx.work))
+            self.assertIn("lf-untracked.txt", full["files"])
+            self.assertIn("readme.txt", full["files"])
+            self.assertEqual(calls, ["ls-files"], calls)
+            del calls[:]
+            tracked_only = gitops.list_files(".", str(self.fx.work), include_untracked=False)
+            self.assertNotIn("lf-untracked.txt", tracked_only["files"])
+            self.assertEqual(calls, ["ls-files"], calls)
+        finally:
+            gitops._run = real
+            os.remove(self.fx.work / "lf-untracked.txt")
+
+    def test_run_never_reads_stdin_or_flashes_a_console(self):
+        """GUI 宿主里每次 git 都不能等 stdin，Windows 上也不许弹控制台窗。"""
+        seen = {}
+        real = subprocess.run
+
+        def capture(*a, **kw):
+            seen.update(kw)
+            return real(*a, **kw)
+
+        subprocess.run = capture
+        try:
+            gitops._run(["rev-parse", "--git-dir"], cwd=str(self.fx.work))
+        finally:
+            subprocess.run = real
+        self.assertIs(seen.get("stdin"), subprocess.DEVNULL)
+        self.assertEqual(seen.get("creationflags"), gitops.NO_WINDOW)
+        if os.name == "nt":
+            self.assertNotEqual(gitops.NO_WINDOW, 0)
+
     def test_list_files_respects_gitignore(self):
         self.fx.write(self.fx.work, "tracked.py", "t\n")
         gitops.commit(".", ["tracked.py"], "feat: 增加 tracked 文件", str(self.fx.work))
