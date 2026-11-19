@@ -14,6 +14,24 @@ const GIT_EVENTS = ['commit', 'push', 'pull', 'discard']
 // Last change this session was told about; the pane reads it with useValue and refreshes
 // when the count moves. `repo` is the resolved work-tree root the backend acted on.
 const $gitChange = atom({ seq: 0, kind: '', repo: '' })
+
+// The composer's coding status bar (branch / ahead-behind / ±) belongs to the app core:
+// there is no plugin-facing refresh door (the loader's import allowlist is
+// @hermes/plugin-sdk + react, and `host` exposes no repo slot), and a pane-driven mutation
+// is a REST call — no tool.complete, so the core's workspace-change edge never fires. The
+// one edge the core does leave open is its `window` focus listener
+// (apps/desktop/src/store/coding-status.ts), so a finished mutation pokes that edge instead
+// of leaving the bar stale until the next turn settles. Its listeners are bounded read-only
+// refreshes (fleet roster, metrics, background sync, sidebar), so this fires once per
+// mutation — never once per repo row.
+const pokeCodingBar = () => {
+  try {
+    window.dispatchEvent(new FocusEvent('focus'))
+  } catch (err) {
+    console.warn('[git-ops] coding-bar refresh', err && err.message)
+  }
+}
+
 const normPath = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
 
 const GET_TIMEOUT = 120000
@@ -539,6 +557,9 @@ function GitPane() {
     setBusy(kind)
     try {
       const data = await api(path, body)
+      // A mutation just landed in the working tree: the pane refreshes below, and the
+      // composer's coding bar needs the poke because REST emits no tool.complete.
+      if (GIT_EVENTS.includes(kind)) pokeCodingBar()
       if (notify) toast(describe(data), 'success')
       return data
     } catch (err) {
@@ -818,6 +839,9 @@ export default {
         const payload = event.payload || {}
         const prev = $gitChange.get()
         $gitChange.set({ seq: prev.seq + 1, kind, repo: payload.repo || '' })
+        // An agent-side tool call did this one; no pane mutation ran, so the coding
+        // bar still needs the poke.
+        pokeCodingBar()
       })
     }
 
