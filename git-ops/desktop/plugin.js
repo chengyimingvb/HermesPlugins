@@ -266,14 +266,14 @@ function SearchList({ all, files, filterActive }) {
   const renderRow = (it) => {
     const isOpen = it.isDir && open.has(it.path)
     return jsxs('div', {
-      className: 'flex min-w-0 cursor-pointer items-center gap-2 rounded px-1 text-xs hover:bg-[var(--ui-row-active-background)]',
+      className: 'flex min-w-0 cursor-pointer items-center gap-2 rounded px-1 text-xs hover:bg-(--ui-row-hover-background)',
       style: { height: ROW, paddingLeft: 4 + it.depth * 12 },
       title: it.path,
       onClick: () => (it.isDir ? toggle(it.path) : copyPath(it.path)),
       children: [
         it.isDir
           ? jsx('svg', {
-              className: 'shrink-0 text-[var(--ui-text-tertiary)] transition-transform duration-150',
+              className: 'shrink-0 text-(--ui-text-tertiary) transition-transform duration-150',
               style: { transform: isOpen ? 'rotate(90deg)' : 'rotate(0deg)', width: 14, height: 14 },
               viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': true,
               children: jsx('path', { d: 'M6 4l4 4-4 4', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round' })
@@ -661,7 +661,7 @@ function GitPane() {
                 type: 'button',
                 onClick: () => { setSearchTerm(''); setSearchSuffix('') },
                 disabled: !searchTerm && !searchSuffix,
-                className: 'rounded px-1 py-0.5 text-xs hover:bg-[var(--ui-row-active-background)] disabled:opacity-40',
+                className: 'rounded px-1 py-0.5 text-xs hover:bg-(--ui-row-hover-background) disabled:opacity-40',
                 style: MUTED,
                 title: '清除过滤条件',
                 children: '清除'
