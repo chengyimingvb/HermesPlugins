@@ -75,6 +75,13 @@ def main() -> int:
         r = client.get(f"{BASE}/diff", params={"repo": ".", "path": "api.txt", "cwd": work}).json()
         check("GET /diff (new file)", r.get("ok") and "api.txt" in r["data"]["diff"], r)
 
+        fx.write(fx.work, "api-fresh.txt", "fresh body\n")
+        r = client.get(f"{BASE}/diff", params={"repo": ".", "path": "api-fresh.txt", "cwd": work,
+                                              "untracked": "true"}).json()
+        check("GET /diff untracked=true reads the file, no git call",
+              r.get("ok") and "fresh body" in r["data"]["diff"], r)
+        (fx.work / "api-fresh.txt").unlink()
+
         (fx.work / "readme.txt").write_text("hello\nchanged\n", encoding="utf-8")
         r = client.get(f"{BASE}/diff", params={"repo": ".", "path": "readme.txt", "cwd": work}).json()
         check("GET /diff (tracked) has +++ b/ header",

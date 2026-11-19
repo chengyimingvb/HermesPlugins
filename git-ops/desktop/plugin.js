@@ -39,6 +39,9 @@ const POST_TIMEOUT = 180000
 const POLL_MS = 5000
 const MAX_POLL_MS = 60000
 const SEARCH_DEBOUNCE_MS = 150
+// A mutation's own /status lands within milliseconds of the event it fires; anything that
+// asks for the same repo inside this window is answering the same question twice.
+const SELF_REFRESH_MS = 1500
 const ROW = 24
 const VIRTUAL_AFTER = 150
 
@@ -183,7 +186,7 @@ function FileList({ files, picked, onPick, onOpen }) {
         jsx('span', {
           className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
           title: `${f.path} · 点击查看 diff`,
-          onClick: () => void onOpen(f.path),
+          onClick: () => void onOpen(f.path, f.code),
           children: [
             jsx('span', { style: { ...MONO, ...(stColor ? { color: stColor } : MUTED) }, children: f.code }),
             jsx('span', { className: 'truncate font-medium', style: stStyle, children: f.path.split('/').pop() })
@@ -365,8 +368,10 @@ function GitPane() {
 
   // resetPicked=false keeps the user's selection across the 5s poll and after a commit;
   // it only resets on a workspace/repo switch.
+  const refreshedAt = useRef(0)
   const refresh = useCallback(async (target, at, resetPicked = false) => {
     if (!target) return null
+    refreshedAt.current = Date.now()
     try {
       const st = await api(`/status?repo=${enc(target)}&cwd=${enc(at || target)}`)
       setStatus(st)
@@ -376,8 +381,10 @@ function GitPane() {
         ? { ...r, branch: st.branch, upstream: st.upstream, ahead: st.ahead,
             behind: st.behind, dirty: (st.files || []).length }
         : r)))
-      const paths = st.files.map((f) => f.path)
-      setPicked((prev) => (resetPicked ? paths : prev.filter((p) => paths.includes(p))))
+      const keep = new Set(st.files.map((f) => f.path))
+      // A Set, not `paths.includes(p)` inside the filter: that was O(files × picked) every
+      // refresh, which a repo with thousands of dirty files felt on each poll.
+      setPicked((prev) => (resetPicked ? [...keep] : prev.filter((p) => keep.has(p))))
       return st
     } catch (err) {
       setStatus(null)
@@ -500,6 +507,12 @@ function GitPane() {
         timer = setTimeout(tick, POLL_MS)
         return
       }
+      // A mutation just refreshed this repo; a read inside that window answers the same
+      // question, so wait out the current backoff instead of paying for it twice.
+      if (Date.now() - refreshedAt.current < SELF_REFRESH_MS) {
+        timer = setTimeout(tick, delay)
+        return
+      }
       const st = await refresh(repo, base)
       // head + dirty count collapse thousands of paths to one comparison: an agent commit
       // flips head and resets the cadence, a no-op poll doubles the gap up to MAX_POLL_MS.
@@ -520,6 +533,10 @@ function GitPane() {
   useEffect(() => {
     if (!change.seq || !repo) return
     if (change.repo && normPath(change.repo) !== normPath(repo)) return
+    // Our own commit/push/discard already refreshed a few milliseconds ago — its event is the
+    // same state, so a second status call would be pure waste. Agent-side events aren't
+    // inside the window (no pane mutation ran) and still refresh the pane.
+    if (Date.now() - refreshedAt.current < SELF_REFRESH_MS) return
     // keep the user's selection across the refresh, exactly like the poll does
     void refresh(repo, base)
   }, [change.seq, change.repo, repo, base, refresh])
@@ -529,11 +546,14 @@ function GitPane() {
     setPicked((prev) => (on ? (prev.includes(path) ? prev : [...prev, path]) : prev.filter((p) => p !== path)))
   }, [])
 
-  const openDiff = useCallback(async (path) => {
+  const openDiff = useCallback(async (path, untracked = false) => {
     if (!repo) return
     setDiff({ path, text: '加载中…', truncated: false })
     try {
-      const d = await api(`/diff?repo=${enc(repo)}&path=${enc(path)}&cwd=${enc(base || repo)}`)
+      // The porcelain code is already in hand, so the backend never asks git whether the
+      // path is untracked — one diff process per click instead of five.
+      const d = await api(`/diff?repo=${enc(repo)}&path=${enc(path)}&cwd=${enc(base || repo)}`
+        + `&untracked=${untracked ? 'true' : 'false'}`)
       setDiff({ path: d.path, text: d.diff, truncated: d.truncated })
     } catch (err) {
       setDiff({ path, text: '无法读取 diff: ' + err.message, truncated: false })
@@ -542,7 +562,7 @@ function GitPane() {
 
   // The row opens TortoiseGit's own diff window; the in-pane dialog is the fallback
   // (no TortoiseGit, untracked/binary file, or a path TortoiseGit refuses).
-  const openItem = useCallback(async (path) => {
+  const openItem = useCallback(async (path, code) => {
     if (!repo) return
     try {
       await api('/tgit', { repo, path, cwd: base || repo })
@@ -550,16 +570,19 @@ function GitPane() {
     } catch (err) {
       console.warn('[git-ops] tortoisegit unavailable:', err.message)
     }
-    await openDiff(path)
+    await openDiff(path, code === '??')
   }, [repo, base, openDiff])
 
-  const run = useCallback(async (kind, path, body, describe, notify = false) => {
+  const run = useCallback(async (kind, path, body, describe, notify = false, poke = true) => {
     setBusy(kind)
+    // Own the window before the call: the mutation's event can land before this promise
+    // resolves, and the refresh below covers the state either way.
+    refreshedAt.current = Date.now()
     try {
       const data = await api(path, body)
       // A mutation just landed in the working tree: the pane refreshes below, and the
       // composer's coding bar needs the poke because REST emits no tool.complete.
-      if (GIT_EVENTS.includes(kind)) pokeCodingBar()
+      if (poke && GIT_EVENTS.includes(kind)) pokeCodingBar()
       if (notify) toast(describe(data), 'success')
       return data
     } catch (err) {
@@ -578,11 +601,13 @@ function GitPane() {
     if (data) setMessage(data.message)
   }, [repo, picked, base, run])
 
-  const doCommit = useCallback(async () => {
+  // poke=false when a push follows immediately: the bar only ever shows the end state, so
+  // the commit's probe would be thrown away a moment later by the push's.
+  const doCommit = useCallback(async (poke = true) => {
     if (!repo) return null
     const committed = await run('commit', '/commit',
       { repo, paths: picked, message: message.trim() ? message : '', cwd: base },
-      (d) => `已提交 ${d.short} ${d.header}`, true)
+      (d) => `已提交 ${d.short} ${d.header}`, true, poke)
     if (!committed) return null
     setMessage('')
     await refresh(repo, base)
@@ -590,12 +615,13 @@ function GitPane() {
   }, [repo, picked, message, base, run, refresh])
 
   const commitAndPush = useCallback(async () => {
-    const committed = await doCommit()
+    const committed = await doCommit(false)
     if (!committed) return
     const pushed = await run('push', '/push', { repo, cwd: base },
       (d) => (d.verified ? `已推送 ${d.short} (verified)` : `推送未确认 ${d.short} ahead=${d.ahead_after}`), true)
     await refresh(repo, base)
-    if (!pushed) toast('提交已保存，但推送失败', 'warning')
+    // The push's poke never ran: the commit still needs its probe reported.
+    if (!pushed) { pokeCodingBar(); toast('提交已保存，但推送失败', 'warning') }
   }, [doCommit, repo, base, run, refresh, toast])
 
   const doPull = useCallback(async () => {
@@ -752,7 +778,7 @@ function GitPane() {
           disabled: disabled || !picked.length, onClick: generate,
           children: busy === 'info' ? '生成中…' : '生成信息' }),
         jsx(Button, { size: 'sm', variant: 'secondary', className: 'w-full',
-          disabled: disabled || !picked.length, onClick: doCommit,
+          disabled: disabled || !picked.length, onClick: () => { void doCommit() },
           children: busy === 'commit' ? '提交中…' : '仅提交' }),
         jsx(Button, { size: 'sm', className: 'w-full',
           disabled: disabled || !picked.length, onClick: commitAndPush,

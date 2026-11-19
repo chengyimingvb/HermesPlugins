@@ -89,11 +89,14 @@ def files(repo: str = Query("."), include_untracked: bool = Query(True),
 
 
 @router.get("/diff")
-def diff(repo: str = Query("."), path: str = Query(""), cwd: str = Query("")) -> dict[str, Any]:
+def diff(repo: str = Query("."), path: str = Query(""), untracked: bool = Query(False),
+         cwd: str = Query("")) -> dict[str, Any]:
     def _one() -> dict[str, Any]:
         top = gitops.resolve_repo(repo, _base(cwd))
         _inside(top, path)
-        text, _files, truncated = gitops._diff(top, [path])
+        # One git call, not the five `_diff` needs: the pane sends the porcelain code it
+        # already has, so an untracked path costs no git process at all.
+        text, truncated = gitops.file_diff(top, path, untracked)
         if not text.strip():
             raise gitops.GitOpsError(f"no diff for {path} (unchanged, or binary)")
         return {"path": path, "diff": text, "truncated": truncated}

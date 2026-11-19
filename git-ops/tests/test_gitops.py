@@ -148,7 +148,7 @@ class GitOpsTests(unittest.TestCase):
         os.remove(self.fx.work / "status-probe.txt")
 
     def test_status_costs_one_git_status_call(self):
-        """One `status --porcelain=v2 --branch` supplies branch/upstream/ahead/behind/files."""
+        """One `status --porcelain=v2 --branch` supplies branch/upstream/ahead/behind/files/gone."""
         calls = []
         real = gitops._run
 
@@ -161,10 +161,112 @@ class GitOpsTests(unittest.TestCase):
             gitops.status(".", str(self.fx.work))
         finally:
             gitops._run = real
-        self.assertEqual(calls.count("status"), 1, calls)
         self.assertNotIn("symbolic-ref", calls)
         self.assertNotIn("rev-list", calls)
-        self.assertLessEqual(len(calls), 4, calls)
+        self.assertNotIn("for-each-ref", calls)  # gone is derived from the status header
+        self.assertEqual(calls.count("status"), 1, calls)
+        self.assertLessEqual(len(calls), 2, calls)  # + a cold rev-parse for the toplevel
+
+    def test_gone_upstream_needs_no_second_process(self):
+        """上流被删时 status 只打 branch.upstream、不打 branch.ab：gone 由它推出。"""
+        root = Path(tempfile.mkdtemp(prefix="gitops-gone-"))
+        try:
+            env = self.fx.env
+            bare, work = root / "o.git", root / "w"
+            run("init", "--bare", "-b", "main", str(bare), env=env)
+            run("clone", str(bare), str(work), env=env)
+            (work / "a.txt").write_text("a\n", encoding="utf-8")
+            run("add", "a.txt", cwd=work, env=env)
+            run("commit", "-m", "feat: a", cwd=work, env=env)
+            run("push", "-u", "origin", "main", cwd=work, env=env)
+            run("checkout", "-b", "side", cwd=work, env=env)
+            run("push", "-u", "origin", "side", cwd=work, env=env)
+            run("push", "origin", "--delete", "side", cwd=work, env=env)
+            calls = []
+            real = gitops._run
+
+            def spy(args, cwd=None, timeout=60):
+                calls.append(args[0])
+                return real(args, cwd, timeout)
+
+            gitops._run = spy
+            try:
+                st = gitops.status(".", str(work))
+            finally:
+                gitops._run = real
+            self.assertEqual(st["upstream"], "origin/side")
+            self.assertEqual(st["gone"], "[gone]")
+            self.assertNotIn("for-each-ref", calls, calls)
+            self.assertEqual(calls.count("status"), 1, calls)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_file_diff_costs_one_git_call(self):
+        """面板点一行：1 次 git；未跟踪文件 0 次（直接读文件），不是 _diff 的 5 次。"""
+        work = str(self.fx.work)
+        top = gitops.toplevel(work)
+        self.fx.write(self.fx.work, "fd-clean.txt", "keep\n")
+        self.fx.write(self.fx.work, "fd-tracked.txt", "one\n")
+        gitops.commit(".", ["fd-clean.txt", "fd-tracked.txt"], "feat: 增加 fd 文件", work)
+        calls = []
+        real = gitops._run
+
+        def spy(args, cwd=None, timeout=60):
+            calls.append(args[0])
+            return real(args, cwd, timeout)
+
+        self.fx.write(self.fx.work, "fd-tracked.txt", "two\n")
+        gitops._run = spy
+        try:
+            text, truncated = gitops.file_diff(top, "fd-tracked.txt")
+            self.assertIn("+two", text)
+            self.assertFalse(truncated)
+            self.assertEqual(calls, ["diff"], calls)
+            # staged + unstaged fold into the one `diff HEAD`
+            run("add", "fd-tracked.txt", cwd=self.fx.work, env=self.fx.env)
+            self.fx.write(self.fx.work, "fd-tracked.txt", "three\n")
+            staged, _ = gitops.file_diff(top, "fd-tracked.txt")
+            self.assertIn("+three", staged)
+            self.assertEqual(len(calls), 2, calls)
+            # untracked: the pane already knows, so no git process at all
+            del calls[:]
+            self.fx.write(self.fx.work, "fd-new.txt", "brand new\n")
+            fresh, _ = gitops.file_diff(top, "fd-new.txt", untracked=True)
+            self.assertIn("brand new", fresh)
+            self.assertIn("new file: fd-new.txt", fresh)
+            self.assertEqual(calls, [], calls)
+            # tracked and unchanged → empty, so the route can say "no diff"
+            clean, _ = gitops.file_diff(top, "fd-clean.txt")
+            self.assertEqual(clean.strip(), "")
+            self.assertEqual(calls, ["diff", "ls-files"], calls)
+        finally:
+            gitops._run = real
+            run("restore", "--staged", "fd-tracked.txt", cwd=self.fx.work, env=self.fx.env)
+            run("restore", "fd-tracked.txt", cwd=self.fx.work, env=self.fx.env)
+            os.remove(self.fx.work / "fd-new.txt")
+
+    def test_push_and_pull_skip_the_untracked_walk(self):
+        """push/pull 只读分支头与 oid：每次 status 都必须带 -uno。"""
+        work = str(self.fx.work)
+        self.fx.write(self.fx.work, "uno.txt", "u\n")
+        gitops.commit(".", ["uno.txt"], "feat: 增加 uno 文件", work)
+        seen = []
+        real = gitops._run
+
+        def spy(args, cwd=None, timeout=60):
+            if args[0] == "status":
+                seen.append(list(args))
+            return real(args, cwd, timeout)
+
+        gitops._run = spy
+        try:
+            gitops.push(".", work)
+            gitops.pull(".", work, "ff", False)
+        finally:
+            gitops._run = real
+        self.assertTrue(seen, "no status calls recorded")
+        for args in seen:
+            self.assertIn("-uno", args, args)
 
     def test_list_files_respects_gitignore(self):
         self.fx.write(self.fx.work, "tracked.py", "t\n")

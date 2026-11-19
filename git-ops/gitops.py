@@ -322,10 +322,10 @@ def status(repo: str, cwd: str) -> dict:
     top = resolve_repo(repo, cwd)
     state = _porcelain(top)
     branch = state["branch"] or "DETACHED"
-    gone = ""
-    if state["branch"] and state["upstream"]:
-        gone = _run(["for-each-ref", "--format=%(upstream:track)",
-                     f"refs/heads/{branch}"], cwd=top, timeout=20).stdout.strip()
+    # One process, not two: `status --porcelain=v2 --branch` prints branch.upstream but no
+    # branch.ab line when the upstream ref is missing (verified against a deleted remote
+    # branch), so "upstream set + ahead unknown" IS the gone signal — no for-each-ref needed.
+    gone = "[gone]" if (state["upstream"] and state["ahead"] is None) else ""
     return {"path": top, "branch": branch, "upstream": state["upstream"],
             "ahead": state["ahead"], "behind": state["behind"], "gone": gone,
             "files": state["files"], "lock": _lock(top),
@@ -504,6 +504,32 @@ def _diff(repo: str, paths: list[str]) -> tuple[str, list[str], bool]:
     return body, list(dict.fromkeys(files + untracked)), truncated
 
 
+def file_diff(top: str, path: str, untracked: bool = False) -> tuple[str, bool]:
+    """One path's net change against HEAD, in ONE git call — the pane's per-row click.
+
+    ``_diff`` runs four diff invocations because commit-message generation wants staged and
+    unstaged bodies separately; a viewer only needs the net change, and ``diff HEAD`` already
+    folds staged into unstaged. ``untracked`` comes from the porcelain code the pane already
+    holds: an untracked path has no diff at all, so read the file instead of asking git.
+    """
+    if not untracked:
+        text = _run(["diff", "HEAD", "--", path], cwd=top, timeout=60).stdout
+        if text.strip():
+            return text[:DIFF_BUDGET], len(text) > DIFF_BUDGET
+        # Empty against HEAD: unchanged, binary-free no-op, or a path git never tracked.
+        if _run(["ls-files", "--error-unmatch", "-z", "--", path], cwd=top).returncode == 0:
+            return "", False
+    try:
+        with open(os.path.join(top, path), "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read(DIFF_BUDGET + 1)
+    except OSError:
+        return "", False
+    if "\x00" in content:  # binary: the text would be noise
+        return "", False
+    body = f"--- new file: {path}\n{content}"
+    return body[:DIFF_BUDGET], len(body) > DIFF_BUDGET
+
+
 def commit_info(repo: str, paths: list[str], cwd: str, llm) -> dict:
     top = resolve_repo(repo, cwd)
     if paths:
@@ -649,7 +675,7 @@ def push(repo: str, cwd: str) -> dict:
         proc = _run(["push"], cwd=top, timeout=GIT_TIMEOUT["push"])
         if proc.returncode != 0:
             raise GitOpsError((proc.stderr or proc.stdout).strip() or "git push failed")
-    after = _porcelain(top)
+    after = _porcelain(top, untracked=False)  # only oid/branch/upstream/ahead are read here
     head = after["oid"] or _ok(top, "rev-parse", "HEAD").strip()
     upstream_sha = _run(["rev-parse", "@{u}"], cwd=top).stdout.strip()
     verified = head == upstream_sha and after["ahead"] == 0
@@ -691,7 +717,7 @@ def pull(repo: str, cwd: str, mode: str = "ff", submodules: bool = True) -> dict
         fetch = _run(["fetch", "--all", "--prune", "--tags"], cwd=top, timeout=GIT_TIMEOUT["pull"])
     if fetch.returncode != 0:
         raise GitOpsError((fetch.stderr or fetch.stdout).strip() or "git fetch failed")
-    counts = _porcelain(top)
+    counts = _porcelain(top, untracked=False)  # ahead/behind/oid only: skip the untracked walk
     ahead, behind = counts["ahead"] or 0, counts["behind"] or 0
     old = (counts["oid"] or _ok(top, "rev-parse", "HEAD").strip())[:7]
     if behind == 0:
@@ -711,7 +737,7 @@ def pull(repo: str, cwd: str, mode: str = "ff", submodules: bool = True) -> dict
     if proc.returncode != 0:
         raise GitOpsError((proc.stderr or proc.stdout).strip()
                           or f"git {command[0]} failed after fetch")
-    final = _porcelain(top)
+    final = _porcelain(top, untracked=False)
     new = (final["oid"] or _ok(top, "rev-parse", "HEAD").strip())[:7]
     return {"path": top, "branch": state["branch"], "pulled": behind, "old": old, "new": new,
             "ahead": final["ahead"] or 0, "behind": final["behind"] or 0,
