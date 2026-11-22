@@ -418,23 +418,27 @@ def _stage(top: str, paths: list[str]) -> list[str]:
     """Add the named paths and prove the index holds the changes asked for and nothing else.
 
     A path missing from the work tree can still be tracked: an unstaged deletion (`rm file`)
-    is in the index and ``git add`` stages the removal. A deletion that is ALREADY staged
-    (`git rm`) is in neither the work tree nor the index and ``git add`` fatals on that
-    pathspec — it needs no add. Any change staged by the user outside ``paths`` is an error,
-    never folded into this commit; a selected path that carries a change the index did not
-    take is also an error, never a silent half-commit.
+    is in the index and ``git add`` stages the removal, and a removed directory is known by
+    the files the index still holds under it. A deletion that is ALREADY staged (`git rm`)
+    is in neither the work tree nor the index and ``git add`` fatals on that pathspec — it
+    needs no add. Any change staged by the user outside ``paths`` is an error, never folded
+    into this commit; a selected path that carries a change the index did not take is also
+    an error, never a silent half-commit.
     """
     _guard_paths(paths)
     known, files = _known_paths(top)
     missing = [p for p in paths if not os.path.exists(os.path.join(top, p))]
-    unknown = [p for p in missing if p not in known]
-    if unknown:
-        raise GitOpsError(f"path not present in work tree: {', '.join(unknown)}")
-    # One index probe, and only when a selected path is gone: a gone path still in the index
-    # is an unstaged deletion, which `git add` stages (git >= 2.0 semantics).
+    # One index probe, and only when a selected path is gone: `ls-files` matches a path and
+    # everything under it, so it answers both "an unstaged deletion" (the blob is still
+    # indexed) and "a deleted directory" (its files are). Files whose deletion is already
+    # staged are in neither place and need no add.
     indexed = ({p for p in _run(["ls-files", "-z", "--", *missing], cwd=top).stdout.split("\0")
                 if p} if missing else set())
-    addable = [p for p in paths if p not in missing or p in indexed]
+    gone = {p for p in missing if any(_in_scope(entry, [p]) for entry in indexed)}
+    unknown = [p for p in missing if p not in known and p not in gone]
+    if unknown:
+        raise GitOpsError(f"path not present in work tree: {', '.join(unknown)}")
+    addable = [p for p in paths if p not in missing or p in gone]
     if addable:
         _ok(top, "add", "--", *addable)
     staged = _staged_paths(top)

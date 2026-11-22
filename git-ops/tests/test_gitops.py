@@ -435,6 +435,19 @@ class GitOpsTests(unittest.TestCase):
                      cwd=self.fx.work, env=self.fx.env).stdout
         self.assertIn("D\tdeep/rm-me.txt", landed)
 
+    def test_commit_unstaged_deletion_of_a_whole_directory(self):
+        """整个目录被删（未暂存）时传目录路径也要能提交：索引里还有它下面的文件。"""
+        self.fx.write(self.fx.work, "deep-dir/a.txt", "a\n")
+        self.fx.write(self.fx.work, "deep-dir/nested/b.txt", "b\n")
+        gitops.commit(".", ["deep-dir"], "feat: 增加 deep-dir 目录", str(self.fx.work))
+        shutil.rmtree(self.fx.work / "deep-dir")
+        result = gitops.commit(".", ["deep-dir"], "chore: 删除 deep-dir 目录", str(self.fx.work))
+        self.assertEqual(sorted(result["files"]), ["deep-dir/a.txt", "deep-dir/nested/b.txt"])
+        landed = run("show", "--name-status", "--format=", "HEAD",
+                     cwd=self.fx.work, env=self.fx.env).stdout
+        self.assertIn("D\tdeep-dir/a.txt", landed)
+        self.assertIn("D\tdeep-dir/nested/b.txt", landed)
+
     def test_commit_deletion_is_not_dropped_when_batched_with_an_edit(self):
         """删除与修改同选：两条都要进这次提交，不能静默只提交一半。"""
         self.fx.write(self.fx.work, "batch-gone.txt", "g\n")
