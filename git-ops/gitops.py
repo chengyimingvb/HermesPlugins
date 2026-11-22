@@ -415,18 +415,26 @@ def _staged_paths(top: str) -> list[str]:
 
 
 def _stage(top: str, paths: list[str]) -> list[str]:
-    """Add the named paths and prove the index holds nothing outside them.
+    """Add the named paths and prove the index holds the changes asked for and nothing else.
 
-    A staged deletion exists neither in the work tree nor in the index and `git add`
-    fatals on that pathspec — it is already staged, so leave it out of the add. Any other
-    change already staged by the user is an error, never folded into this commit.
+    A path missing from the work tree can still be tracked: an unstaged deletion (`rm file`)
+    is in the index and ``git add`` stages the removal. A deletion that is ALREADY staged
+    (`git rm`) is in neither the work tree nor the index and ``git add`` fatals on that
+    pathspec — it needs no add. Any change staged by the user outside ``paths`` is an error,
+    never folded into this commit; a selected path that carries a change the index did not
+    take is also an error, never a silent half-commit.
     """
     _guard_paths(paths)
     known, files = _known_paths(top)
-    missing = [p for p in paths if not os.path.exists(os.path.join(top, p)) and p not in known]
-    if missing:
-        raise GitOpsError(f"path not present in work tree: {', '.join(missing)}")
-    addable = [p for p in paths if p in known and os.path.exists(os.path.join(top, p))]
+    missing = [p for p in paths if not os.path.exists(os.path.join(top, p))]
+    unknown = [p for p in missing if p not in known]
+    if unknown:
+        raise GitOpsError(f"path not present in work tree: {', '.join(unknown)}")
+    # One index probe, and only when a selected path is gone: a gone path still in the index
+    # is an unstaged deletion, which `git add` stages (git >= 2.0 semantics).
+    indexed = ({p for p in _run(["ls-files", "-z", "--", *missing], cwd=top).stdout.split("\0")
+                if p} if missing else set())
+    addable = [p for p in paths if p not in missing or p in indexed]
     if addable:
         _ok(top, "add", "--", *addable)
     staged = _staged_paths(top)
@@ -441,6 +449,15 @@ def _stage(top: str, paths: list[str]) -> list[str]:
             "index already holds changes outside the selected paths: "
             + ", ".join(sorted(extras))
             + " — unstage them (git restore --staged <path>) or add them to paths")
+    # The mirror of ``extras``: every selected path that carries a change of its own (the
+    # target of a rename, never its source) must be in the index, so a selected path can
+    # never be dropped from the commit without an error.
+    carrying = {entry["path"] for entry in files}
+    unstaged = [p for p in paths if p in carrying and not _in_scope(p, staged)]
+    if unstaged:
+        raise GitOpsError(
+            "selected paths carry a change the index does not hold: "
+            + ", ".join(sorted(unstaged)))
     return staged
 
 

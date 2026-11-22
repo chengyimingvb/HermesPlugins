@@ -422,6 +422,35 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(result["files"], ["gone.txt"])
         self.assertEqual(run("ls-files", "--", "gone.txt", cwd=self.fx.work).stdout.strip(), "")
 
+    def test_commit_unstaged_deletion(self):
+        """工作区里直接删掉的文件（未暂存）也要能提交：索引里还有它，git add 暂存这次删除。"""
+        self.fx.write(self.fx.work, "deep/rm-me.txt", "r\n")
+        gitops.commit(".", ["deep/rm-me.txt"], "feat: 增加 rm-me 文件", str(self.fx.work))
+        os.remove(self.fx.work / "deep/rm-me.txt")
+        result = gitops.commit(".", ["deep/rm-me.txt"], "chore: 删除 rm-me 文件", str(self.fx.work))
+        self.assertEqual(result["files"], ["deep/rm-me.txt"])
+        self.assertEqual(run("ls-files", "--", "deep/rm-me.txt",
+                             cwd=self.fx.work, env=self.fx.env).stdout.strip(), "")
+        landed = run("show", "--name-status", "--format=", "HEAD",
+                     cwd=self.fx.work, env=self.fx.env).stdout
+        self.assertIn("D\tdeep/rm-me.txt", landed)
+
+    def test_commit_deletion_is_not_dropped_when_batched_with_an_edit(self):
+        """删除与修改同选：两条都要进这次提交，不能静默只提交一半。"""
+        self.fx.write(self.fx.work, "batch-gone.txt", "g\n")
+        self.fx.write(self.fx.work, "batch-keep.txt", "k\n")
+        gitops.commit(".", ["batch-gone.txt", "batch-keep.txt"],
+                      "feat: 增加批量用例文件", str(self.fx.work))
+        os.remove(self.fx.work / "batch-gone.txt")
+        self.fx.write(self.fx.work, "batch-keep.txt", "k2\n")
+        result = gitops.commit(".", ["batch-gone.txt", "batch-keep.txt"],
+                               "chore: 批量删除与修改", str(self.fx.work))
+        self.assertEqual(sorted(result["files"]), ["batch-gone.txt", "batch-keep.txt"])
+        landed = run("show", "--name-status", "--format=", "HEAD",
+                     cwd=self.fx.work, env=self.fx.env).stdout
+        self.assertIn("D\tbatch-gone.txt", landed)
+        self.assertIn("M\tbatch-keep.txt", landed)
+
     def test_pull_advances_detached_submodule_to_its_gitlink(self):
         """detached 的子模块仍跟父级 gitlink 前进：修复不能削弱原来的建树语义。"""
         consumer = self.fx._clone(self.fx.origin, "consumer-detached")
