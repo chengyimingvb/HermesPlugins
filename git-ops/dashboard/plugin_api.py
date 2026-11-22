@@ -3,7 +3,7 @@
 Thin HTTP shell over the plugin's own ``gitops.py`` — one implementation, two doors
 (agent tools and this UI). Every route answers ``{"ok": bool, "data"|"error": ...}``.
 
-Mutating work (commit / push / pull / discard / launching TortoiseGit) is POST only: a
+Mutating work (commit / push / pull / discard / launching a GUI) is POST only: a
 GET has to stay safe to prefetch, or a link preview can create a commit or pop a window.
 """
 
@@ -165,10 +165,10 @@ def discard(payload: dict = Body(...)) -> dict[str, Any]:
     return _envelope(gitops.discard, payload.get("repo") or ".", payload.get("paths") or [],
                      _base(payload.get("cwd")))
 
-# ── TortoiseGit bridge ───────────────────────────────────────────────────
+# ── external GUI bridge (TortoiseGit / VS Code) ──────────────────────────
 # The desktop half can only hand the OS a URL (``ctx.os.openExternal`` admits web
-# schemes), so opening TortoiseGit's own diff window has to happen here: this
-# backend runs in the plugin-host process and can spawn a GUI child.
+# schemes), so opening TortoiseGit's own diff window — or an editor — has to happen
+# here: this backend runs in the plugin-host process and can spawn a GUI child.
 
 
 def _tgit_exe() -> str:
@@ -187,6 +187,19 @@ def _tgit_exe() -> str:
 
 
 def _raise_window_to_front(pid: int, timeout: float = 2.0) -> None:
+    """Best effort: the GUI is already open, so a failed raise must not fail its door.
+
+    pywin32 may be absent or SetForegroundWindow refused, and the caller has already
+    spawned a working window by then — reporting an error there would have the UI fall
+    through to the in-pane diff on top of a GUI that opened fine.
+    """
+    try:
+        _raise_window_impl(pid, timeout)
+    except Exception:  # noqa: BLE001 - cosmetic, see above
+        pass
+
+
+def _raise_window_impl(pid: int, timeout: float = 2.0) -> None:
     """Bring the spawned process's main window over Hermes once it appears.
 
     A DETACHED child builds its window in the background, so Hermes keeps the
@@ -277,4 +290,74 @@ def launch_tgit_diff(repo: str, path: str, cwd: str) -> dict[str, Any]:
 def tgit(payload: dict = Body(...)) -> dict[str, Any]:
     """Launch TortoiseGit's diff window. Any error here means the UI falls back to ``/diff``."""
     return _envelope(launch_tgit_diff, payload.get("repo") or ".", payload.get("path") or "",
+                     _base(payload.get("cwd")))
+
+
+def _code_exe() -> str:
+    """VS Code's binary on Windows, where a bare ``code`` must not be trusted.
+
+    A VS Code fork (Qoder, Cursor) usually owns the ``code`` name, so PATH would launch
+    the wrong editor: the Microsoft installer's per-user registration is authoritative,
+    and its default install dirs are the fallback.
+    """
+    if os.name != "nt":
+        found = shutil.which("code") or shutil.which("code-insiders")
+        if found:
+            return found
+        raise gitops.GitOpsError("VS Code CLI (code) not found on PATH")
+    import winreg
+    try:
+        with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Code.exe") as key:
+            candidate = winreg.QueryValueEx(key, "")[0]
+        # The installer writes REG_SZ, but a REG_EXPAND_SZ value comes back unexpanded,
+        # and CreateProcess would receive a literal %VAR%: hand back the expanded path.
+        provider = os.path.expandvars(candidate)
+        if os.path.isfile(provider):
+            return provider
+    except OSError:
+        pass
+    for root in (os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Programs"),
+                 os.environ.get("ProgramFiles") or r"C:\Program Files",
+                 os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"):
+        candidate = os.path.join(root, "Microsoft VS Code", "Code.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    raise gitops.GitOpsError("VS Code not installed (Code.exe not found)")
+
+
+def _spawn_code(exe: str, target: str, cwd: str) -> None:
+    """``-g`` opens the file itself; the editor's own gutter shows what changed."""
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    proc = subprocess.Popen([exe, "-g", target], cwd=cwd, close_fds=True, creationflags=flags)
+    # A cold start builds its window behind Hermes; an already running VS Code is
+    # reused and raises itself, so the poll below just finds no window and returns.
+    # Windows-only: this helper imports pywin32, and the posix branch of _code_exe
+    # must still report the launch it actually performed.
+    pid = getattr(proc, "pid", None)
+    if pid and os.name == "nt":
+        _raise_window_to_front(pid)
+
+
+def launch_vscode(repo: str, path: str, cwd: str) -> dict[str, Any]:
+    """Open one work-tree file in VS Code — the fallback when there is no diff to show.
+
+    No tracking check: this door exists for the paths TortoiseGit refuses (untracked,
+    binary) and for files whose diff is empty. A deleted file has nothing on disk to
+    open, so it stays an error and the UI shows the deletion diff instead.
+    """
+    top = gitops.resolve_repo(repo, cwd)
+    target = _inside(top, path)
+    if not os.path.isfile(target):
+        raise gitops.GitOpsError(f"no such file on disk: {path}")
+    exe = _code_exe()
+    _spawn_code(exe, target, top)
+    return {"launched": True, "exe": exe, "path": target}
+
+
+@router.post("/vscode")
+def vscode(payload: dict = Body(...)) -> dict[str, Any]:
+    """Open the path in VS Code. Any error here means the UI falls back to ``/diff``."""
+    return _envelope(launch_vscode, payload.get("repo") or ".", payload.get("path") or "",
                      _base(payload.get("cwd")))

@@ -146,13 +146,14 @@ def main() -> int:
               r.get("ok") is False and "untracked" in r["error"], r)
         (fx.work / "api-untracked.txt").unlink()
 
-        # TortoiseGit bridge: stub the process so no GUI window opens during the test.
+        # GUI bridges (TortoiseGit + VS Code): stub the process so no window opens.
         calls = []
-        real_subprocess, real_exe = api.subprocess, api._tgit_exe
+        real_subprocess, real_exe, real_code = api.subprocess, api._tgit_exe, api._code_exe
 
         class FakePopen:
             def __init__(self, args, **kwargs):
                 calls.append(list(args))
+                self.pid = 4242  # a real Popen has one; the window-raise reads it
 
         class FakeSubprocess:
             # Only the api module's binding is shadowed: gitops keeps the real
@@ -161,6 +162,13 @@ def main() -> int:
             DETACHED_PROCESS = getattr(real_subprocess, "DETACHED_PROCESS", 0)
             CREATE_NEW_PROCESS_GROUP = getattr(real_subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
+        raised = []
+
+        def record(pid):
+            raised.append(pid)
+
+        real_raise, real_os = api._raise_window_to_front, api.os
+        api._raise_window_to_front = record
         api.subprocess = FakeSubprocess
         api._tgit_exe = lambda: r"C:\Program Files\TortoiseGit\bin\TortoiseGitProc.exe"
         try:
@@ -171,6 +179,7 @@ def main() -> int:
             check("POST /tgit asks for /command:diff with an absolute path",
                   len(args) == 4 and args[1] == "/command:diff" and args[2].startswith("/path:")
                   and args[2].lower().replace("\\", "/").endswith("readme.txt"), args)
+            check("POST /tgit raises the window it opened", raised == [4242], raised)
             check("GET /tgit is gone (no side effect on prefetch)",
                   client.get(f"{BASE}/tgit", params={"repo": ".", "path": "readme.txt"}).status_code == 405)
 
@@ -189,8 +198,100 @@ def main() -> int:
                             json={"repo": ".", "path": "readme.txt", "cwd": work}).json()
             check("POST /tgit reports a missing TortoiseGit",
                   r.get("ok") is False and "not installed" in r["error"], r)
+
+            # VS Code door: same stub, so no editor window opens either. This is the
+            # fallback for the paths TortoiseGit refuses and for a file with no diff.
+            calls.clear()
+            api._code_exe = lambda: r"C:\Program Files\Microsoft VS Code\Code.exe"
+            r = client.post(f"{BASE}/vscode",
+                            json={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+            check("POST /vscode launches", r.get("ok") and r["data"]["launched"], r)
+            args = calls[0] if calls else []
+            check("POST /vscode asks for -g with an absolute path",
+                  len(args) == 3 and args[1] == "-g"
+                  and args[2].lower().replace("\\", "/").endswith("readme.txt"), args)
+            check("GET /vscode is gone (no side effect on prefetch)",
+                  client.get(f"{BASE}/vscode",
+                             params={"repo": ".", "path": "readme.txt"}).status_code == 405)
+
+            fx.write(fx.work, "vscode-untracked.txt", "x\n")
+            r = client.post(f"{BASE}/vscode",
+                            json={"repo": ".", "path": "vscode-untracked.txt",
+                                   "cwd": work}).json()
+            check("POST /vscode opens an untracked file (no tracking check)",
+                  r.get("ok") and r["data"]["launched"], r)
+            (fx.work / "vscode-untracked.txt").unlink()
+
+            # A tracked file that is gone from disk: there is nothing to open, so the
+            # UI must stay able to show the deletion diff instead.
+            (fx.work / "readme.txt").unlink()
+            r = client.post(f"{BASE}/vscode",
+                            json={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+            check("POST /vscode refuses a deleted tracked file",
+                  r.get("ok") is False and "no such file" in r["error"], r)
+            fx.write(fx.work, "readme.txt", "hello\n")
+
+            r = client.post(f"{BASE}/vscode",
+                            json={"repo": ".", "path": "../escape.txt", "cwd": work}).json()
+            check("POST /vscode refuses a path outside the repo",
+                  r.get("ok") is False and "escapes" in r["error"], r)
+
+            api._code_exe = lambda: (_ for _ in ()).throw(api.gitops.GitOpsError("VS Code not installed"))
+            r = client.post(f"{BASE}/vscode",
+                            json={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+            check("POST /vscode reports a missing editor",
+                  r.get("ok") is False and "not installed" in r["error"], r)
+
+            # The window-raise is the Windows half of the bridge: a posix spawn must
+            # still report the launch it performed, not fail after opening the editor
+            # (which would make the UI show a diff dialog over a working editor).
+            class _PosixOs:
+                name = "posix"
+
+                def __getattr__(self, item):
+                    return getattr(os, item)
+
+            calls.clear()
+            api.os = _PosixOs()
+            api._code_exe = lambda: "/usr/bin/code"
+            api._raise_window_to_front = lambda pid: (
+                _ for _ in ()).throw(ModuleNotFoundError("No module named win32gui"))
+            r = {}
+            try:
+                r = client.post(f"{BASE}/vscode",
+                                json={"repo": ".", "path": "readme.txt", "cwd": work}).json()
+            finally:
+                api.os, api._raise_window_to_front = real_os, record
+            check("POST /vscode on posix reports the launch without the win32 helper",
+                  r.get("ok") and r["data"]["launched"] and len(calls) == 1, r)
+
+            # The resolver must take the installer's own registration, never a `code`
+            # from PATH: a VS Code fork (Qoder, Cursor) usually owns that name.
+            if os.name == "nt":
+                import winreg
+
+                class _Key:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *exc):
+                        return False
+
+                real_open, real_query = winreg.OpenKey, winreg.QueryValueEx
+                os.environ["GITOPS_TEST_CODE"] = str(fx.work)
+                winreg.OpenKey = lambda hive, sub: _Key()
+                winreg.QueryValueEx = lambda key, name: (r"%GITOPS_TEST_CODE%\readme.txt", 1)
+                try:
+                    registered = real_code()
+                finally:
+                    winreg.OpenKey, winreg.QueryValueEx = real_open, real_query
+                    os.environ.pop("GITOPS_TEST_CODE", None)
+                check("_code_exe expands the registered path and prefers it over PATH's code",
+                      os.path.normcase(registered) == os.path.normcase(str(fx.work / "readme.txt")),
+                      registered)
         finally:
-            api.subprocess, api._tgit_exe = real_subprocess, real_exe
+            api.subprocess, api._tgit_exe, api._code_exe = real_subprocess, real_exe, real_code
+            api._raise_window_to_front, api.os = real_raise, real_os
     finally:
         fx.close()
     print(f"\nSUMMARY: {len(failures)} failed")

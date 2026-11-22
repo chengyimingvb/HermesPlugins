@@ -6,7 +6,7 @@ Hermes 桌面端（Electron）插件集合。纯前端 ESM 部分无构建步骤
 |---|---|
 | [`turn-indicator`](./turn-indicator) | 输入框上方常驻一行「本轮在干什么」：脉冲 + 实时文案 + 秒数；`::turn{}` 内联指令；运行中显示工具行 |
 | [`read-only-mode`](./read-only-mode) | 输入框 `+` 右侧的只读开关（对应 Cursor 的 Ask 模式），开启后每条消息带只读约束 |
-| [`git-ops`](./git-ops) | 右侧 Git 面板 + 9 个 agent 工具：多仓库扫描、状态 / diff / log、生成提交信息、按显式路径提交、推送验证、拉取、放弃修改（含 `dashboard/plugin_api.py` 后端）。提交/推送/拉取/放弃后同步刷新输入框上方的 coding status bar（分支 / 领先落后 / ±）。面板计时器全部走 `ctx.setTimeout`（重载不残留轮询）、中英文文案走 `ctx.i18n`、忽略后缀 / 轮询间隔 / 扫描深度在 **Settings ▸ Plugins ▸ Git Ops** 里配 |
+| [`git-ops`](./git-ops) | 右侧 Git 面板 + 9 个 agent 工具：多仓库扫描、状态 / diff / log、生成提交信息、按显式路径提交、推送验证、拉取、放弃修改（含 `dashboard/plugin_api.py` 后端）。点文件行按 TortoiseGit → VS Code → 面板内 diff 三级降级打开。提交/推送/拉取/放弃后同步刷新输入框上方的 coding status bar（分支 / 领先落后 / ±）。面板计时器全部走 `ctx.setTimeout`（重载不残留轮询）、中英文文案走 `ctx.i18n`、忽略后缀 / 轮询间隔 / 扫描深度在 **Settings ▸ Plugins ▸ Git Ops** 里配 |
 
 ## 安装
 

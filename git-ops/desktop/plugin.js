@@ -177,7 +177,7 @@ const MESSAGES = {
       emptyRepo: '(空仓库)'
     },
     git: { noRepo: '未找到仓库', clean: '工作区干净', noGit: '无 Git 仓库' },
-    tip: { row: '点击查看 diff' },
+    tip: { row: '点击打开 diff（TortoiseGit / VS Code）' },
     message: { placeholder: '提交信息（可留空，提交时自动生成）' },
     button: {
       scan: '扫描中…',
@@ -241,7 +241,7 @@ const MESSAGES = {
       emptyRepo: '(empty repo)'
     },
     git: { noRepo: 'No repository found', clean: 'Working tree clean', noGit: 'No git repository' },
-    tip: { row: 'Click to view the diff' },
+    tip: { row: 'Click to open the diff (TortoiseGit / VS Code)' },
     message: { placeholder: 'Commit message (leave empty to generate one)' },
     button: {
       scan: 'Scanning…',
@@ -800,15 +800,19 @@ function GitPane() {
     }
   }, [repo, base, t])
 
-  // The row opens TortoiseGit's own diff window; the in-pane dialog is the fallback
-  // (no TortoiseGit, untracked/binary file, or a path TortoiseGit refuses).
+  // Row click: TortoiseGit's own window → the file in VS Code → the in-pane dialog.
+  // Any /tgit failure falls through (not installed, a path it refuses, a transient
+  // backend error), and a binary has no text diff at all, so the editor is the door
+  // that always has the file itself to show.
   const openItem = useCallback(async (path, code) => {
     if (!repo) return
-    try {
-      await api('/tgit', { repo, path, cwd: base || repo })
-      return
-    } catch (err) {
-      console.warn('[git-ops] tortoisegit unavailable:', err.message)
+    for (const route of ['/tgit', '/vscode']) {
+      try {
+        await api(route, { repo, path, cwd: base || repo })
+        return
+      } catch (err) {
+        console.warn(`[git-ops] ${route} unavailable:`, err.message)
+      }
     }
     await openDiff(path, code === '??')
   }, [repo, base, openDiff])
