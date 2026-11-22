@@ -177,7 +177,11 @@ const MESSAGES = {
       emptyRepo: '(空仓库)'
     },
     git: { noRepo: '未找到仓库', clean: '工作区干净', noGit: '无 Git 仓库' },
-    tip: { row: '点击打开 diff（TortoiseGit / VS Code）' },
+    tip: {
+      row: '点击打开 diff（TortoiseGit / VS Code）',
+      openFile: '点击用 VS Code 打开',
+      copyPath: '复制工程内路径'
+    },
     message: { placeholder: '提交信息（可留空，提交时自动生成）' },
     button: {
       scan: '扫描中…',
@@ -215,6 +219,7 @@ const MESSAGES = {
       discarded: (n) => `已放弃 ${n} 个文件的修改`,
       failed: (m) => `失败: ${m}`,
       filesFailed: (m) => `加载文件列表失败: ${m}`,
+      openFailed: (m) => `无法用 VS Code 打开: ${m}`,
       prefsSaved: '设置已保存'
     },
     settings: {
@@ -241,7 +246,11 @@ const MESSAGES = {
       emptyRepo: '(empty repo)'
     },
     git: { noRepo: 'No repository found', clean: 'Working tree clean', noGit: 'No git repository' },
-    tip: { row: 'Click to open the diff (TortoiseGit / VS Code)' },
+    tip: {
+      row: 'Click to open the diff (TortoiseGit / VS Code)',
+      openFile: 'Click to open in VS Code',
+      copyPath: 'Copy the repo-relative path'
+    },
     message: { placeholder: 'Commit message (leave empty to generate one)' },
     button: {
       scan: 'Scanning…',
@@ -279,6 +288,7 @@ const MESSAGES = {
       discarded: (n) => `Discarded changes in ${n} files`,
       failed: (m) => `Failed: ${m}`,
       filesFailed: (m) => `Cannot load the file list: ${m}`,
+      openFailed: (m) => `Cannot open it in VS Code: ${m}`,
       prefsSaved: 'Settings saved'
     },
     settings: {
@@ -351,6 +361,19 @@ function FileIcon() {
     children: jsx('path', {
       d: 'M5 1.5h3.7L12 4.8V13a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V2.5A1 1 0 0 1 5 1.5Z',
       stroke: 'currentColor', strokeWidth: 1.2, strokeLinejoin: 'round'
+    })
+  })
+}
+
+// Same fixed 13px slot in the 24px row as the folder/file glyphs, so the tree's names
+// keep their column when the hover-only button appears.
+function CopyIcon() {
+  return jsx('svg', {
+    className: 'shrink-0', viewBox: '0 0 16 16', width: 13, height: 13,
+    fill: 'none', 'aria-hidden': true, style: { color: 'var(--ui-text-tertiary)' },
+    children: jsx('path', {
+      d: 'M6.5 1.5H11a1 1 0 0 1 1 1V7M4.5 4.5h5a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1h-5a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1Z',
+      stroke: 'currentColor', strokeWidth: 1.2, strokeLinecap: 'round', strokeLinejoin: 'round'
     })
   })
 }
@@ -441,8 +464,12 @@ function FileList({ files, picked, onPick, onOpen }) {
 // Two render modes, switched by whether a filter is active:
 //   * filterActive (关键词/后缀非空) → flat filtered list (existing behaviour).
 //   * otherwise → repo file tree; all dirs start collapsed, a click expands
-//     that level one step, while a file row copies its path.
-function SearchList({ all, files, filterActive }) {
+//     that level one step, while a file row opens the file in VS Code and its
+//     hover-only button copies the repo-relative path.
+//
+// File rows share one click/hover contract in both modes: click = open in VS Code,
+// hover = reveal the copy button.
+function SearchList({ all, files, filterActive, onOpen }) {
   const t = usePluginI18n(ID)
   const ref = useRef(null)
   const [view, setView] = useState({ top: 0, height: 320 })
@@ -510,10 +537,10 @@ function SearchList({ all, files, filterActive }) {
   const renderRow = (it) => {
     const isOpen = it.isDir && open.has(it.path)
     return jsxs('div', {
-      className: 'flex min-w-0 cursor-pointer items-center gap-2 rounded px-1 text-xs hover:bg-(--ui-row-hover-background)',
+      className: 'group flex min-w-0 cursor-pointer items-center gap-2 rounded px-1 text-xs hover:bg-(--ui-row-hover-background)',
       style: { height: ROW, paddingLeft: 4 + it.depth * 12 },
-      title: it.path,
-      onClick: () => (it.isDir ? toggle(it.path) : copyPath(it.path)),
+      title: it.isDir ? it.path : `${it.path} · ${t('tip.openFile')}`,
+      onClick: () => (it.isDir ? toggle(it.path) : void onOpen(it.path)),
       children: [
         it.isDir
           ? jsx('svg', {
@@ -528,6 +555,17 @@ function SearchList({ all, files, filterActive }) {
           className: 'min-w-0 flex-1 truncate font-medium',
           style: it.isDir ? undefined : MUTED,
           children: it.name
+        }),
+        // The row opens the file, so copying its repo-relative path needs its own door.
+        // group-hover (a real emitted rule) fades it in over the row's 24px box; the hit
+        // area follows the fade, so a click on the invisible corner still opens the file.
+        it.isDir ? null : jsx('button', {
+          type: 'button',
+          className: 'ml-1 shrink-0 cursor-pointer rounded px-1 py-0.5 opacity-0 transition-opacity pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto hover:bg-(--ui-bg-tertiary)',
+          title: t('tip.copyPath'),
+          'aria-label': t('tip.copyPath'),
+          onClick: (e) => { e.stopPropagation(); copyPath(it.path) },
+          children: jsx(CopyIcon, {})
         })
       ]
     }, it.path)
@@ -800,6 +838,18 @@ function GitPane() {
     }
   }, [repo, base, t])
 
+  // File-tree row click: VS Code only. The tree navigates the work tree (no diff to
+  // show for a clean file), and /vscode takes every path that exists on disk — a tracked
+  // file deleted from the work tree is the one failure, and its reason is reported.
+  const openInCode = useCallback(async (path) => {
+    if (!repo) return
+    try {
+      await api('/vscode', { repo, path, cwd: base || repo })
+    } catch (err) {
+      toast(t('toast.openFailed', err.message), 'error')
+    }
+  }, [repo, base, t, toast])
+
   // Row click: TortoiseGit's own window → the file in VS Code → the in-pane dialog.
   // Any /tgit failure falls through (not installed, a path it refuses, a transient
   // backend error), and a binary has no text diff at all, so the editor is the door
@@ -960,7 +1010,8 @@ function GitPane() {
             jsx(SearchList, {
               all: fileList,
               files: visibleFiles,
-              filterActive: Boolean(debTerm || debSuffix)
+              filterActive: Boolean(debTerm || debSuffix),
+              onOpen: openInCode
             })
           ] })
         : null,
