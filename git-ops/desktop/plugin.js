@@ -180,7 +180,8 @@ const MESSAGES = {
     tip: {
       row: '点击打开 diff（TortoiseGit / VS Code）',
       openFile: '点击用 VS Code 打开',
-      copyPath: '复制工程内路径'
+      copyPath: '复制工程内路径',
+      untracked: '未跟踪的新文件：放弃修改不会删除它'
     },
     message: { placeholder: '提交信息（可留空，提交时自动生成）' },
     button: {
@@ -206,7 +207,8 @@ const MESSAGES = {
     diff: { truncated: 'diff 已截断', loading: '加载中…', failed: (m) => `无法读取 diff: ${m}` },
     discard: {
       title: '放弃修改？',
-      body: (n) => `将把 ${n} 个已跟踪文件的索引与工作区还原到 HEAD，不可撤销。未跟踪文件不在其中。`
+      body: (n, untracked) => `将把 ${n} 个已跟踪文件的索引与工作区还原到 HEAD，不可撤销。`
+        + (untracked ? `另有 ${untracked} 个未跟踪的新文件不会被删除。` : '')
     },
     toast: {
       generated: (header, truncated) => `生成 ${header}${truncated ? '（diff 已截断）' : ''}`,
@@ -216,7 +218,8 @@ const MESSAGES = {
       committedNotPushed: '提交已保存，但推送失败',
       pulled: (n, from, to) => `拉取 ${n} 个提交 ${from}→${to}`,
       upToDate: '已是最新',
-      discarded: (n) => `已放弃 ${n} 个文件的修改`,
+      discarded: (n, untracked) => `已放弃 ${n} 个文件的修改`
+        + (untracked ? `，${untracked} 个未跟踪文件未删除` : ''),
       failed: (m) => `失败: ${m}`,
       filesFailed: (m) => `加载文件列表失败: ${m}`,
       openFailed: (m) => `无法用 VS Code 打开: ${m}`,
@@ -249,7 +252,8 @@ const MESSAGES = {
     tip: {
       row: 'Click to open the diff (TortoiseGit / VS Code)',
       openFile: 'Click to open in VS Code',
-      copyPath: 'Copy the repo-relative path'
+      copyPath: 'Copy the repo-relative path',
+      untracked: 'Untracked new file: discarding never deletes it'
     },
     message: { placeholder: 'Commit message (leave empty to generate one)' },
     button: {
@@ -275,7 +279,8 @@ const MESSAGES = {
     diff: { truncated: 'diff truncated', loading: 'Loading…', failed: (m) => `Cannot read the diff: ${m}` },
     discard: {
       title: 'Discard changes?',
-      body: (n) => `Index and work tree of ${n} tracked files go back to HEAD. Irreversible. Untracked files are not included.`
+      body: (n, untracked) => `Index and work tree of ${n} tracked files go back to HEAD. Irreversible.`
+        + (untracked ? ` ${untracked} untracked new file(s) are not deleted.` : '')
     },
     toast: {
       generated: (header, truncated) => `Generated ${header}${truncated ? ' (diff truncated)' : ''}`,
@@ -285,7 +290,8 @@ const MESSAGES = {
       committedNotPushed: 'Commit saved, but the push failed',
       pulled: (n, from, to) => `Pulled ${n} commits ${from}→${to}`,
       upToDate: 'Already up to date',
-      discarded: (n) => `Discarded changes in ${n} files`,
+      discarded: (n, untracked) => `Discarded changes in ${n} files`
+        + (untracked ? `, kept ${untracked} untracked file(s)` : ''),
       failed: (m) => `Failed: ${m}`,
       filesFailed: (m) => `Cannot load the file list: ${m}`,
       openFailed: (m) => `Cannot open it in VS Code: ${m}`,
@@ -430,7 +436,7 @@ function FileList({ files, picked, onPick, onOpen }) {
         }),
         jsx('span', {
           className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
-          title: `${f.path} · ${t('tip.row')}`,
+          title: `${f.path} · ${t(f.code === '??' ? 'tip.untracked' : 'tip.row')}`,
           onClick: () => void onOpen(f.path, f.code),
           children: [
             jsx('span', { style: { ...MONO, ...(stColor ? { color: stColor } : MUTED) }, children: f.code }),
@@ -929,7 +935,7 @@ function GitPane() {
     setConfirmDiscard(false)
     if (!repo || !picked.length) return
     const data = await run('discard', '/discard', { repo, paths: picked, cwd: base },
-      (d) => t('toast.discarded', d.discarded.length), true)
+      (d) => t('toast.discarded', d.discarded.length, (d.skipped || []).length), true)
     if (data) await refresh(repo, base)
   }, [repo, picked, base, run, t, refresh])
 
@@ -937,6 +943,10 @@ function GitPane() {
   const repoReady = Boolean(repo) && repos.some((r) => r.path === repo)
   const disabled = !repoReady || Boolean(busy)
   const allPicked = files.length > 0 && picked.length === files.length
+  // Discard is per-file, never all-or-nothing: the backend skips untracked paths and says
+  // how many, so the confirm dialog counts the same way the call will act.
+  const pickedUntracked = files.filter((f) => picked.includes(f.path) && f.code === '??').length
+  const pickedTracked = picked.length - pickedUntracked
   // Client-side search filter: term matches anywhere in the repo-relative path,
   // suffix matches the bytes after the last dot ('.py' and '*.py' both accepted).
   const visibleFiles = useMemo(() => {
@@ -1128,7 +1138,7 @@ function GitPane() {
                 children: jsx(DialogTitle, { className: 'text-sm', children: t('discard.title') })
               }),
               jsx('div', { className: 'text-xs', style: MUTED,
-                children: t('discard.body', picked.length) }),
+                children: t('discard.body', pickedTracked, pickedUntracked) }),
               jsxs('div', { className: 'flex justify-end gap-2', children: [
                 jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => setConfirmDiscard(false),
                   children: t('button.cancel') }),

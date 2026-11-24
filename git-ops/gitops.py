@@ -371,11 +371,6 @@ def validate_message(message: str) -> Optional[str]:
 SWEEPING = {"-A", "--all", ".", "-u", "--update", ":/*"}
 
 
-def _indexed(top: str) -> set[str]:
-    """Paths in the index. A staged deletion is absent here but still known to git."""
-    return set(p for p in _run(["ls-files", "-z"], cwd=top).stdout.split("\0") if p)
-
-
 def _guard_paths(paths: list[str]) -> None:
     if not paths:
         raise GitOpsError("paths is required: stage explicit paths (no 'add -A')")
@@ -656,26 +651,36 @@ def list_files(repo: str, cwd: str, include_untracked: bool = True) -> dict:
 def discard(repo: str, paths: list[str], cwd: str) -> dict:
     """Throw work-tree changes away for tracked paths (index and work tree back to HEAD).
 
-    Untracked paths are refused: deleting a file the user never committed is not a
-    decision this tool should make for them.
+    Untracked paths are never deleted, and they no longer fail the call either: they come
+    back in ``skipped``, so one new file picked next to real edits cannot block the rest.
+    A path counts as discardable when git's own status names it — both sides of a rename,
+    and either column of a staged change: an index dump would misread a staged deletion
+    (gone from the index, still in HEAD) as untracked and refuse a restore git handles fine.
+
+    ``discarded`` lists the paths that are clean once this returns, so a restore that did
+    nothing (no commit yet to restore from) reports ``discarded: []`` with the path in
+    ``still_dirty`` instead of claiming work it never performed.
     """
     top = resolve_repo(repo, cwd)
     _guard_paths(paths)
-    indexed = _indexed(top)
-    untracked = [p for p in paths if p not in indexed]
-    if untracked:
-        raise GitOpsError("refusing to discard untracked paths (delete them yourself): "
-                          + ", ".join(untracked))
-    try:
-        _ok(top, "restore", "--source=HEAD", "--staged", "--worktree", "--", *paths,
-            timeout=GIT_TIMEOUT["commit"])
-    except GitOpsError:
-        # A file absent from HEAD cannot be restored from it: unstage, then check out.
-        _run(["restore", "--staged", "--", *paths], cwd=top, timeout=GIT_TIMEOUT["commit"])
-        _ok(top, "checkout", "--", *paths, timeout=GIT_TIMEOUT["commit"])
-    touched = set(paths)
-    remaining = [f["path"] for f in _dirty(top) if f["path"] in touched]
-    return {"path": top, "discarded": paths, "still_dirty": remaining}
+    entries = _dirty(top)
+    known = {p for entry in entries for p in (entry["path"], entry.get("from", "")) if p}
+    untracked = {entry["path"] for entry in entries if entry["code"] == "??"}
+    tracked = [p for p in paths if p in known and p not in untracked]
+    if tracked:
+        try:
+            _ok(top, "restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked,
+                timeout=GIT_TIMEOUT["commit"])
+        except GitOpsError:
+            # A file absent from HEAD cannot be restored from it: unstage, then check out.
+            _run(["restore", "--staged", "--", *tracked], cwd=top, timeout=GIT_TIMEOUT["commit"])
+            _ok(top, "checkout", "--", *tracked, timeout=GIT_TIMEOUT["commit"])
+    dirty_after = {f["path"] for f in _dirty(top)}
+    skipped = {p for p in paths if p not in set(tracked)}
+    return {"path": top,
+            "discarded": [p for p in tracked if p not in dirty_after],
+            "skipped": [p for p in paths if p in skipped],
+            "still_dirty": [p for p in tracked if p in dirty_after]}
 
 
 # ── push ─────────────────────────────────────────────────────────────────

@@ -133,17 +133,29 @@ def main() -> int:
         r = client.get(f"{BASE}/commit", params={"repo": ".", "cwd": work})
         check("POST-only routes reject GET", r.status_code == 405, r.status_code)
 
-        # discard: tracked file only, untracked refused
+        # discard: tracked paths restore, untracked paths are skipped (never deleted,
+        # never fatal) — one new file must not block the edits picked next to it.
         (fx.work / "readme.txt").write_text("dirty\n", encoding="utf-8")
         r = client.post(f"{BASE}/discard", json={"repo": ".", "paths": ["readme.txt"],
                                                  "cwd": work}).json()
         check("POST /discard restores a tracked file",
-              r.get("ok") and r["data"]["still_dirty"] == [], r)
+              r.get("ok") and r["data"]["still_dirty"] == [] and r["data"]["skipped"] == [], r)
         fx.write(fx.work, "api-untracked.txt", "u\n")
+        (fx.work / "readme.txt").write_text("dirty again\n", encoding="utf-8")
+        r = client.post(f"{BASE}/discard",
+                        json={"repo": ".", "paths": ["readme.txt", "api-untracked.txt"],
+                              "cwd": work}).json()
+        check("POST /discard skips untracked and still restores the tracked path",
+              r.get("ok") and r["data"]["discarded"] == ["readme.txt"]
+              and r["data"]["skipped"] == ["api-untracked.txt"]
+              and r["data"]["still_dirty"] == []
+              and (fx.work / "api-untracked.txt").exists(), r)
         r = client.post(f"{BASE}/discard", json={"repo": ".", "paths": ["api-untracked.txt"],
                                                  "cwd": work}).json()
-        check("POST /discard refuses untracked",
-              r.get("ok") is False and "untracked" in r["error"], r)
+        check("POST /discard on untracked only is a no-op, not an error",
+              r.get("ok") and r["data"]["discarded"] == []
+              and r["data"]["skipped"] == ["api-untracked.txt"]
+              and (fx.work / "api-untracked.txt").exists(), r)
         (fx.work / "api-untracked.txt").unlink()
 
         # GUI bridges (TortoiseGit + VS Code): stub the process so no window opens.

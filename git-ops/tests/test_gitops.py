@@ -690,16 +690,14 @@ class GitOpsTests(unittest.TestCase):
             self.assertEqual(payload["kind"], "commit")
             self.assertEqual(payload["repo"], gitops.resolve_repo(work, work))
             self.assertEqual(payload["sha"], answer["data"]["sha"])
-            # A failed call must stay silent, or the pane refreshes on nothing. An untracked
-            # path is the cheapest real refusal; ev.txt stays committed (no dirty work tree
-            # left behind for the tests that share this fixture).
+            # A failed call must stay silent, or the pane refreshes on nothing. A sweeping
+            # pathspec is the cheapest real refusal (an untracked path is no longer one: it
+            # now succeeds with a 'skipped' list), and it touches no file.
             events.clear()
-            self.fx.write(self.fx.work, "ev-untracked.txt", "u\n")
             failed = json.loads(calls["git_discard"]["handler"](
-                {"repo": work, "paths": ["ev-untracked.txt"]}))
+                {"repo": work, "paths": ["."]}))
             self.assertFalse(failed["ok"], failed)
             self.assertEqual(events, [])
-            os.remove(self.fx.work / "ev-untracked.txt")
         finally:
             if saved is None:
                 os.environ.pop("HERMES_SESSION_ID", None)
@@ -751,13 +749,28 @@ class GitOpsTests(unittest.TestCase):
         result = gitops.discard(".", ["keep.txt"], str(self.fx.work))
         self.assertEqual(result["discarded"], ["keep.txt"])
         self.assertEqual(result["still_dirty"], [])
+        self.assertEqual(result["skipped"], [])
         self.assertEqual((self.fx.work / "keep.txt").read_text(encoding="utf-8"), "v1\n")
-        # untracked is refused, never deleted
+        # An untracked path is never deleted and never blocks the tracked paths beside it.
         self.fx.write(self.fx.work, "fresh.txt", "f\n")
-        with self.assertRaises(gitops.GitOpsError) as ctx:
-            gitops.discard(".", ["fresh.txt"], str(self.fx.work))
-        self.assertIn("untracked", str(ctx.exception))
+        self.fx.write(self.fx.work, "keep.txt", "v3\n")
+        result = gitops.discard(".", ["keep.txt", "fresh.txt"], str(self.fx.work))
+        self.assertEqual(result["discarded"], ["keep.txt"])
+        self.assertEqual(result["skipped"], ["fresh.txt"])
+        self.assertEqual(result["still_dirty"], [])
+        self.assertEqual((self.fx.work / "keep.txt").read_text(encoding="utf-8"), "v1\n")
         self.assertTrue((self.fx.work / "fresh.txt").exists())
+        # ... and an untracked-only selection is an empty result, not a failure.
+        result = gitops.discard(".", ["fresh.txt"], str(self.fx.work))
+        self.assertEqual(result["discarded"], [])
+        self.assertEqual(result["skipped"], ["fresh.txt"])
+        self.assertTrue((self.fx.work / "fresh.txt").exists())
+        # A staged deletion is tracked (it is gone from the index but lives in HEAD), so it
+        # restores instead of being misread as untracked.
+        run("rm", "-q", "keep.txt", cwd=self.fx.work, env=self.fx.env)
+        result = gitops.discard(".", ["keep.txt"], str(self.fx.work))
+        self.assertEqual(result["discarded"], ["keep.txt"], result)
+        self.assertEqual((self.fx.work / "keep.txt").read_text(encoding="utf-8"), "v1\n")
         os.remove(self.fx.work / "fresh.txt")
 
 

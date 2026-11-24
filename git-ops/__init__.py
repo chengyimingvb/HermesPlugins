@@ -168,7 +168,9 @@ _TOOLS = [
     ("git_discard", {
         "name": "git_discard",
         "description": "Throw away work-tree changes for explicit tracked paths (index and work tree "
-                       "back to HEAD). Irreversible. Untracked paths are refused.",
+                       "back to HEAD). Irreversible. Untracked paths are never deleted — they are "
+                       "reported in 'skipped' instead of failing the call, and 'still_dirty' lists "
+                       "whatever stayed dirty.",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO,
             "paths": _PATHS,
