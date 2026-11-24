@@ -1,6 +1,6 @@
 name: turn-indicator
-version: "0.5.3"
-description: One row above the desktop composer for the turn in progress — a steady square, a live activity label and a per-turn timer, kept mounted for the whole turn (a latch, not the gateway's flickering busy flag) — plus a `::turn{}` inline twin, every tool row hidden from the transcript, and a breathing edge on the bubble of the current turn.
+version: "0.6.0"
+description: One row above the desktop composer for the turn in progress — a steady square, a live activity label and a per-turn timer, kept mounted for the whole turn (a latch, not the gateway's flickering busy flag) — plus a `::turn{}` inline twin, every tool row hidden from the transcript, the activity row under the bubble hidden outright, and a breathing edge on the bubble of the current turn.
 author: CY
 license: MIT
 requires_hermes: ">=0.22.7"

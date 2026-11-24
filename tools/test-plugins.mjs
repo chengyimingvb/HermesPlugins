@@ -7,11 +7,14 @@
  *     leftover debug probe; `plugin.yaml` matches the folder name.
  *  2. LOGIC   — the SHIPPED source is extracted and driven directly (no mirror):
  *       * turn-indicator's turn latch, against a fake clock: it must survive a
- *         `busy` drop while a tool is in flight and close only after SETTLE_MS.
+ *         `busy` drop while a tool is in flight, close only after SETTLE_MS, and
+ *         ignore other sessions' turns (one composer narrates one chat).
+ *       * turn-indicator's rising-edge bookkeeping: session-store churn must not
+ *         zero a running tool's count or wipe its label.
  *       * turn-indicator's `describeTool` label mapping.
  *       * turn-glow's injected CSS contract: exactly one animated target (the
  *         bubble), a `from`/`to` + `alternate` loop, no invented radius, no
- *         `!important` fighting core.
+ *         `!important` fighting core, and the `sr-only` un-clip core needs.
  *
  *   node tools/test-plugins.mjs            # all plugins
  *   node tools/test-plugins.mjs turn-glow  # one plugin's static checks only
@@ -131,7 +134,7 @@ function latchChecks() {
   const source = fs.readFileSync(file, 'utf8')
 
   const settleMs = Number(/settleMs: (\d+)/.exec(source)?.[1])
-  const chainMs = Number(/const CHAIN_MS = (\d+)/.exec(source)?.[1])
+  const repaintMs = Number(/const REPAINT_MS = (\d+)/.exec(source)?.[1])
   const glowAttr = /const GLOW_ATTR = '([^']+)'/.exec(source)?.[1]
   const actAttr = /const ACT_ATTR = '([^']+)'/.exec(source)?.[1]
   const block = extract(source, [
@@ -139,8 +142,8 @@ function latchChecks() {
     '    const onLive = (type, handler) =>'
   ])
 
-  if (!settleMs || !chainMs || !glowAttr || !actAttr || !block) {
-    fail('could not extract settleMs/CHAIN_MS/GLOW_ATTR/ACT_ATTR/pendingBySession…live() from the source')
+  if (!settleMs || !repaintMs || !glowAttr || !actAttr || !block) {
+    fail('could not extract settleMs/REPAINT_MS/GLOW_ATTR/ACT_ATTR/pendingBySession…live() from the source')
 
     return
   }
@@ -154,18 +157,23 @@ let __bySession = {}
 let __turn = false
 let __now = 0
 let __timers = []
-let __prefs = { bubbleGlow: true, toolRows: true, settleMs: ${settleMs} }
+let __activity = ''
+let __prefs = { bubbleGlow: true, toolRows: true, hideActivityRow: false, settleMs: ${settleMs} }
 const $prefs = { get: () => __prefs, subscribe: () => () => {} }
 const prefs = () => __prefs
-const CHAIN_MS = ${chainMs}
+const REPAINT_MS = ${repaintMs}
 const GLOW_ATTR = '${glowAttr}'
 const ACT_ATTR = '${actAttr}'
 const Date = { now: () => __now }
+const setActivity = value => { __activity = value }
+// host.state substitutes: read-only atoms, since the latch block under test only
+// reads them (the subscription wiring lives outside the extracted slice).
+const stateAtom = get => ({ get, subscribe: () => () => {} })
 const host = { state: {
-  busy: { get: () => __busy },
-  awaitingResponse: { get: () => __awaiting },
-  busyBySession: { get: () => __bySession },
-  focusedSessionId: { get: () => __focused }
+  busy: stateAtom(() => __busy),
+  awaitingResponse: stateAtom(() => __awaiting),
+  busyBySession: stateAtom(() => __bySession),
+  focusedSessionId: stateAtom(() => __focused)
 } }
 const $turn = { get: () => __turn, set: value => { __turn = value } }
 const ctx = { setTimeout: (fn, ms) => { __timers.push({ at: __now + ms, fn }); return () => {} } }
@@ -213,7 +221,7 @@ ${block}
 
 return {
   live,
-  settle,
+  close,
   paintGlow,
   clearGlow,
   paintActivity,
@@ -222,8 +230,11 @@ return {
   glowMarked: () => (__glow.isOn() ? 1 : 0),
   activityMarked: () => __act.isOn(),
   bumpPending,
-  pendingCount,
   resetPending,
+  pendingCount: () => Object.values(pendingBySession).reduce((sum, n) => sum + n, 0),
+  syncBusy,
+  setActivity,
+  activity: () => __activity,
   setBusy: value => { __busy = value },
   setAwaiting: value => { __awaiting = value },
   setBySession: value => { __bySession = value },
@@ -233,7 +244,7 @@ return {
   setPrefs: value => { __prefs = { ...__prefs, ...value } },
   turn: () => __turn,
   settleMs: ${settleMs},
-  chainMs: CHAIN_MS,
+  repaintMs: REPAINT_MS,
   advance: ms => {
     const target = __now + ms
 
@@ -258,20 +269,20 @@ return {
   // A) a long tool runs and the gateway drops `busy` — the old code unmounted here.
   api.setBusy(true)
   api.live()
-  check('opening the turn also re-tags the glow (one shared tick)', api.glowQueries() > 0)
+  check('opening the turn also re-tags the glow (one shared repaint)', api.glowQueries() > 0)
   api.advance(200)
   api.setBusy(false)
   api.setPending(1)
   api.advance(settleMs * 4)
   check('survives a busy=false gap while a tool is in flight', api.turn() === true)
 
-  // B) the tool lands (its event is live) → still up at SETTLE_MS-100, gone by SETTLE_MS+chain.
+  // B) the tool lands (its event is live) → still up at SETTLE_MS-100, gone after.
   api.setPending(0)
   api.live()
   api.advance(settleMs - 100)
   check(`still open ${settleMs - 100}ms after the last signal`, api.turn() === true)
-  api.advance(chainMs * 2)
-  check(`closed within ${chainMs * 2}ms of the settle window`, api.turn() === false)
+  api.advance(settleMs * 2)
+  check('closed once the settle window ran out', api.turn() === false)
   check('closing the turn drops the glow tag', api.glowMarked() === 0)
 
   // C) the send→first-token window holds the row on its own.
@@ -280,17 +291,23 @@ return {
   api.setAwaiting(false)
   api.advance(settleMs - 100)
   check('a send waiting on its first token holds the row', api.turn() === true)
-  api.advance(chainMs * 2)
+  api.advance(settleMs * 2)
   check('…and lets go once nothing is live', api.turn() === false)
 
-  // D) `busy` follows TILE FOCUS: another session mid-turn must hold this row up.
+  // D) `composer.top` is ONE chat's strip: another session (a bot, a Kanban
+  //    worker, another tile) mid-turn must not narrate itself here, while the
+  //    focused chat's own per-session busy flag must still hold the row up.
   api.setBySession({ s1: false, s2: true })
   api.live()
+  api.advance(settleMs * 2)
+  check('another session mid-turn does not hold this pane open', api.turn() === false)
+  api.setBySession({ s1: true, s2: true })
+  api.live()
   api.advance(settleMs * 3)
-  check('another session mid-turn keeps the row open', api.turn() === true)
+  check('the focused chat’s own mid-turn does hold it open', api.turn() === true)
   api.setBySession({})
-  api.advance(settleMs + chainMs * 2)
-  check('and closes once every session is idle', api.turn() === false)
+  api.advance(settleMs * 3)
+  check('and closes once it is idle', api.turn() === false)
 
   // E) a busy turn is never closed by idle time alone; then the real end.
   api.setBusy(true)
@@ -300,7 +317,7 @@ return {
   api.setBusy(false)
   api.advance(settleMs - 100)
   check('open just inside the settle window after the turn ends', api.turn() === true)
-  api.advance(chainMs * 2)
+  api.advance(settleMs * 2)
   check('closed just after it', api.turn() === false)
 
   // F) the tag is bound to the turn, not just to the pref: a settings save and a
@@ -346,9 +363,44 @@ return {
   api.paintActivity()
   check('tool rows visible → core narrates itself, no tag', api.activityMarked() === false)
   api.setPrefs({ toolRows: true })
+  api.setTurn(true)
+  api.setPrefs({ hideActivityRow: true })
+  api.paintActivity()
+  check('a hidden activity row is never tagged', api.activityMarked() === false)
+  api.setPrefs({ hideActivityRow: false })
   api.setTurn(false)
   api.paintActivity()
   check('the pulse tag goes away with the turn', api.activityMarked() === false)
+
+  // I) session-store churn must not wipe the turn's own bookkeeping. The
+  //    subscription fires on EVERY $sessionStates write (usage ticks, heartbeats,
+  //    tool activity) and $busyBySession is a fresh object each time, so an
+  //    unconditional reset zeroed a running tool's count ~1/s and dropped the
+  //    label back to 思考中 mid-turn.
+  api.resetPending()
+  api.setBusy(false)
+  api.syncBusy()
+  api.setBusy(true)
+  api.syncBusy()
+  api.bumpPending({ session_id: 's1' }, 1)
+  api.setActivity('执行命令')
+  api.syncBusy()
+  api.syncBusy()
+  api.syncBusy()
+  check('store churn keeps the running tool count', api.pendingCount() === 1, `count=${api.pendingCount()}`)
+  check('store churn keeps the activity label', api.activity() === '执行命令', `label="${api.activity()}"`)
+  api.setBusy(false)
+  api.syncBusy()
+  api.setBusy(true)
+  api.syncBusy()
+  check(
+    'a genuine new turn still starts from a clean slate',
+    api.pendingCount() === 0 && api.activity() === '',
+    `count=${api.pendingCount()} label="${api.activity()}"`
+  )
+
+  // J) nothing polls: the close window is one timer, the repaint is event-driven.
+  check('the latch does not poll for a tick', !source.includes('CHAIN_MS'))
 
   // The counting has to sit OUTSIDE the focus filter, which is what `onLive`
   // applies — registering these two through it is the bug being fixed here.
@@ -419,7 +471,7 @@ function glowCssChecks() {
   }
 
   const buildCss = new Function(`const GLOW_ATTR = 'turn-glow'\nconst ACT_ATTR = 'ti-live'\n${block}\nreturn buildCss`)()
-  const defaults = { toolRows: true, bubbleGlow: true, glowMs: 1200, glowStrength: 55 }
+  const defaults = { toolRows: true, hideActivityRow: false, bubbleGlow: true, glowMs: 1200, glowStrength: 55 }
   const all = buildCss(defaults)
   // The tool-row rule keeps its `!important` (it has to beat Tailwind); the glow
   // rules must not, or they would outrank the theme for every later revision.
@@ -457,6 +509,9 @@ function glowCssChecks() {
   const idle = all.slice(all.indexOf('[data-ti-live]'))
   check('the core pulse row is re-armed for idle windows', idle.includes('data-state="idle"') && idle.includes('::before'))
   check('the re-armed row does not use !important', !idle.includes('!important'))
+  // Tailwind v4's `.sr-only` is `clip-path: inset(50%)` and ships no `clip`, so
+  // resetting `clip` alone left the restored row laid out but painted empty.
+  check('the re-armed row un-clips sr-only (clip-path: none)', idle.includes('clip-path: none'))
   check('the dither square is drawn with the theme colour', idle.includes('repeating-conic-gradient(currentColor') && idle.includes('border-radius: 2px'))
   check(
     'toolRows=false leaves core activity row alone',
@@ -465,6 +520,20 @@ function glowCssChecks() {
   check('bubbleGlow=false drops the glow', !buildCss({ ...defaults, bubbleGlow: false }).includes('@keyframes'))
   check('glowMs reaches the animation', buildCss({ ...defaults, glowMs: 2000 }).includes('2000ms'))
   check('glowStrength reaches the keyframes', buildCss({ ...defaults, glowStrength: 80 }).includes('80%'))
+
+  // The row under the bubble: one rule, and the idle repair for that same row
+  // goes away with it (repairing a node nothing can see is dead weight).
+  const hidden = buildCss({ ...defaults, hideActivityRow: true })
+  check(
+    'hideActivityRow hides the whole activity row',
+    hidden.includes('[data-slot="aui_turn-activity"] { display: none !important; }')
+  )
+  check('hideActivityRow drops the idle repair', !hidden.includes('[data-ti-live]'))
+  check('hideActivityRow keeps the tool-row rule', hidden.includes('[data-slot="tool-block"]'))
+  check(
+    'hideActivityRow=false leaves the row on screen',
+    !all.includes('aui_turn-activity"] { display: none')
+  )
 }
 
 // ── 2d. the settings record's coercion ───────────────────────────────────────
@@ -504,10 +573,16 @@ return { readPrefsFrom, savePrefs, PREF_DEFAULTS }`
   check('a negative number clamps to the bottom', junk.settleMs === 500)
   check('a non-boolean flag is not truthy-coerced', junk.inlineDirective === defaults.inlineDirective)
   check('composerRow: an off switch survives', api.readPrefsFrom({ composerRow: false }).composerRow === false)
+  check(
+    'hideActivityRow: an off switch survives',
+    api.readPrefsFrom({ hideActivityRow: false }).hideActivityRow === false
+  )
+  check('hideActivityRow defaults to on', defaults.hideActivityRow === true)
   // The two places the new pref has to reach, or the toggle would save and do
   // nothing: the badge renderer and the settings page's checkbox.
   check('the composer row reads composerRow', source.includes('!settings.composerRow || !working'))
   check('the settings page offers composerRow', source.includes("checkbox('composerRow'"))
+  check('the settings page offers hideActivityRow', source.includes("'hideActivityRow',"))
   check('savePrefs clamps on the way in too', api.savePrefs({ glowMs: 1 }).glowMs === 400)
   check('junk input cannot throw', typeof api.savePrefs(null).glowMs === 'number')
 }

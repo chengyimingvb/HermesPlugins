@@ -15,9 +15,14 @@
  * slot's `empty:hidden` wrapper leaves no gap. A second contribution renders
  * the `::turn{}` twin inline in the transcript.
  *
- * Data: host.state atoms + their events. `busy` is the focused chat's own flag
- * and can lag a tab switch, so the per-session map covers a chat that is still
- * mid-turn after focus moved away.
+ * Data: host.state atoms + their events. `busy` is the FOCUSED chat's own flag
+ * and drops across every gap inside a turn, so the latch is held by the focused
+ * session's per-session busy flag plus its own in-flight tool count. Other
+ * sessions are counted (their calls must be closed out) but never light this
+ * pane: `composer.top` is one chat's strip, not a global activity light.
+ *
+ * Cost: one timer per `settleMs` while a turn is open, plus a debounced repaint
+ * when the transcript mutates. Nothing is polled.
  *
  * Plain ESM, loaded uncompiled: UI is jsx() calls, styles are inline (Tailwind
  * classes are compiled from core source and would not exist for a plugin).
@@ -47,9 +52,6 @@ const label = () => zh('思考中', 'Thinking')
  * indicator narrates the same thing the transcript would.
  *
  * '' means "no specific activity" and the component falls back to 思考中.
- * Writes are deduped by hand: nanostores notifies on a same-value set, and
- * `message.delta` arrives ~30×/s, so an unguarded set would re-render the
- * strip for every token.
  */
 const $activity = atom('')
 
@@ -72,6 +74,11 @@ const PREF_KEY = 'prefs'
 const PREF_DEFAULTS = {
   composerRow: true,
   toolRows: true,
+  // Core's own row under the bubble is the SECOND narrator of a turn. With the
+  // tool rows hidden the composer line above already says what is running, so
+  // the row is redundant chrome; the switch exists because removing it leaves
+  // the bubble side empty for the idle windows core suppresses its pulse in.
+  hideActivityRow: true,
   bubbleGlow: true,
   glowMs: 1200,
   glowStrength: 55,
@@ -107,6 +114,7 @@ function readPrefs() {
   return {
     composerRow: asBool(raw.composerRow, PREF_DEFAULTS.composerRow),
     toolRows: asBool(raw.toolRows, PREF_DEFAULTS.toolRows),
+    hideActivityRow: asBool(raw.hideActivityRow, PREF_DEFAULTS.hideActivityRow),
     bubbleGlow: asBool(raw.bubbleGlow, PREF_DEFAULTS.bubbleGlow),
     glowMs: clampInt(raw.glowMs, GLOW_MS_MIN, GLOW_MS_MAX, PREF_DEFAULTS.glowMs),
     glowStrength: clampInt(raw.glowStrength, STRENGTH_MIN, STRENGTH_MAX, PREF_DEFAULTS.glowStrength),
@@ -142,6 +150,7 @@ function readPrefsFrom(raw) {
   return {
     composerRow: asBool(source.composerRow, PREF_DEFAULTS.composerRow),
     toolRows: asBool(source.toolRows, PREF_DEFAULTS.toolRows),
+    hideActivityRow: asBool(source.hideActivityRow, PREF_DEFAULTS.hideActivityRow),
     bubbleGlow: asBool(source.bubbleGlow, PREF_DEFAULTS.bubbleGlow),
     glowMs: clampInt(source.glowMs, GLOW_MS_MIN, GLOW_MS_MAX, PREF_DEFAULTS.glowMs),
     glowStrength: clampInt(source.glowStrength, STRENGTH_MIN, STRENGTH_MAX, PREF_DEFAULTS.glowStrength),
@@ -154,19 +163,17 @@ const $prefs = atom(PREF_DEFAULTS)
 
 const prefs = () => $prefs.get()
 
-/** Latch re-check cadence while a turn is open. */
-const CHAIN_MS = 400
+/** Debounce for the event-driven repaint of the glow / pulse tags. */
+const REPAINT_MS = 200
 
 /**
- * The live plugin instance. A hot reload registers the NEW instance BEFORE the
- * old one disposes (`runtime-loader`: register then dispose), so an unguarded
- * dispose tears down its own replacement: the stylesheet element has the same id
- * (so the old `style.remove()` strips the new rules) and the latch below is one
- * shared atom (so the old `$turn.set(false)` hides the new row). Both teardowns
- * therefore run only while this instance is still the owner — which is also why
- * saving plugin.js used to leave the row missing until the next gateway event.
+ * A reload disposes the previous incarnation BEFORE registering the new one
+ * (`runtime-loader`: unload, then activate) and re-evaluates the module from a
+ * fresh blob URL, so every module-scope binding here (`$turn`, `$activity`,
+ * `$prefs`) belongs to exactly one loaded revision and no dispose can reach
+ * across into its replacement. That is why neither the stylesheet element nor
+ * the latch needs an owner guard.
  */
-let owner = null
 
 /** Attribute on the turn pair whose bubbles breathe (`turn-glow`). */
 const GLOW_ATTR = 'turn-glow'
@@ -180,6 +187,9 @@ const GLOW_ATTR = 'turn-glow'
  * is the right call while the tool rows are on screen, but this plugin hides
  * every tool row, so those two gates were the whole turn with nothing to look
  * at. The tag lets a stylesheet put the pulse back for exactly those windows.
+ *
+ * Dormant while `hideActivityRow` is on: the row is display:none then, so there
+ * is nothing to repair and nothing is tagged (see `paintActivity`).
  */
 const ACT_ATTR = 'ti-live'
 
@@ -198,42 +208,67 @@ const ACT_ATTR = 'ti-live'
  * `!important` kill takes every animation out for a user who asks for it).
  *
  * The style ELEMENT id stays `turn-indicator-hide-changes` even though it now
- * carries two jobs: renaming it strands the previous revision's element (its
- * dispose is owner-guarded), and that stale element would keep serving the old
- * rules.
+ * carries two jobs: it is the id an already-installed revision's element was
+ * created with, and renaming it would leave that element in the document
+ * serving the old rules until the window reloads.
  */
 const buildCss = p => {
   let css = ''
 
   if (p.toolRows) {
     css += '[data-slot="tool-block"] { display: none !important; }\n'
+
     // With the rows gone, core's own pulse is the only thing left on the bubble
     // side — and core suppresses it exactly while a tool call runs or the turn
     // has been quiet for under 2s, i.e. most of a turn. Restore that row for
     // those windows only: `data-state="active"` keeps core's real node (with its
     // timer text), `idle` gets the same dither square this plugin draws above
-    // the composer. `clip`/`rect` are `sr-only`'s own declarations, overridden
-    // one by one because core ships it as a utility class.
-    css +=
-      `[data-${ACT_ATTR}][data-slot="aui_turn-activity"][data-state="idle"] {\n` +
-      '  position: static;\n' +
-      '  width: auto;\n' +
-      '  height: auto;\n' +
-      '  margin: 0;\n' +
-      '  overflow: visible;\n' +
-      '  clip: auto;\n' +
-      '  border-width: 0;\n' +
-      '}\n' +
-      `[data-${ACT_ATTR}][data-slot="aui_turn-activity"][data-state="idle"]::before {\n` +
-      "  content: '';\n" +
-      '  display: inline-block;\n' +
-      '  flex: 0 0 auto;\n' +
-      '  width: 12px;\n' +
-      '  height: 12px;\n' +
-      '  border-radius: 2px;\n' +
-      '  opacity: 0.8;\n' +
-      '  background: repeating-conic-gradient(currentColor 0% 25%, transparent 0% 50%) 0 0 / 0.125rem 0.125rem;\n' +
-      '}\n'
+    // the composer. `sr-only`'s declarations are overridden one by one because
+    // core ships it as a utility class — and `clip-path` is the one that matters:
+    // Tailwind v4's `sr-only` is `clip-path: inset(50%)` (it ships no `clip` at
+    // all), so resetting `clip` alone left the restored row laid out but painted
+    // empty.
+    //
+    // Skipped entirely when the row is hidden (`hideActivityRow`): repairing a
+    // node nothing can see is dead weight in the stylesheet.
+    if (!p.hideActivityRow) {
+      css +=
+        `[data-${ACT_ATTR}][data-slot="aui_turn-activity"][data-state="idle"] {\n` +
+        '  position: static;\n' +
+        '  width: auto;\n' +
+        '  height: auto;\n' +
+        '  margin: 0;\n' +
+        '  overflow: visible;\n' +
+        '  clip: auto;\n' +
+        '  clip-path: none;\n' +
+        '  border-width: 0;\n' +
+        '}\n' +
+        `[data-${ACT_ATTR}][data-slot="aui_turn-activity"][data-state="idle"]::before {\n` +
+        "  content: '';\n" +
+        '  display: inline-block;\n' +
+        '  flex: 0 0 auto;\n' +
+        '  width: 12px;\n' +
+        '  height: 12px;\n' +
+        '  border-radius: 2px;\n' +
+        '  opacity: 0.8;\n' +
+        '  background: repeating-conic-gradient(currentColor 0% 25%, transparent 0% 50%) 0 0 / 0.125rem 0.125rem;\n' +
+        '}\n'
+    }
+  }
+
+  // Core's whole activity row under the bubble — pulse, hint and the ticking
+  // seconds. It is the DUPLICATE narrator of the turn: the composer line above
+  // already says what is running, and core hides this row for most of a turn
+  // anyway (it yields to a narrating tool call and to any gap shorter than
+  // TURN_QUIET_S), so what is left is a square that appears and disappears.
+  // Approval cards and the changed-files card are different slots and stay.
+  //
+  // `display: none`, not a visually-hidden clip: the row is a polite live
+  // region whose timer re-renders once a second, so leaving it for assistive
+  // tech would re-announce the turn every second. Nothing is lost — the
+  // composer line is the same live region, with a label and the same seconds.
+  if (p.hideActivityRow) {
+    css += '[data-slot="aui_turn-activity"] { display: none !important; }\n'
   }
 
   if (p.bubbleGlow) {
@@ -255,11 +290,9 @@ const buildCss = p => {
   return css
 }
 
-const setActivity = next => {
-  if ($activity.get() !== next) {
-    $activity.set(next)
-  }
-}
+/** The SDK re-exports nanostores' own `atom`, whose `set` skips an identical
+ *  value — so `message.delta` (~30/s) costs one string compare, not a render. */
+const setActivity = next => $activity.set(next)
 
 /** Last path segment of the tool's target, for "Editing plugin.js". */
 const baseName = path => {
@@ -397,7 +430,9 @@ function Indicator() {
     children: [
       jsx('span', { key: 'box', style: boxStyle }),
       jsx('span', { key: 'label', children: text }),
-      jsx('span', { key: 'timer', style: { opacity: 0.7 }, children: `${elapsed}s` })
+      // `aria-hidden`: the seconds tick once a second inside a polite live
+      // region, so a screen reader would announce the whole row every second.
+      jsx('span', { 'aria-hidden': true, key: 'timer', style: { opacity: 0.7 }, children: `${elapsed}s` })
     ]
   })
 }
@@ -455,7 +490,7 @@ function DirectiveLine({ attrs }) {
     children: [
       jsx('span', { key: 'box', style: boxStyle }),
       jsx('span', { key: 'label', children: override || activity || label() }),
-      jsx('span', { key: 'timer', style: { opacity: 0.7 }, children: `${seconds}s` })
+      jsx('span', { 'aria-hidden': true, key: 'timer', style: { opacity: 0.7 }, children: `${seconds}s` })
     ]
   })
 }
@@ -512,6 +547,10 @@ function SettingsPage() {
       }),
       checkbox('composerRow', zh('显示输入框上方的状态行', 'Show the status row above the composer')),
       checkbox('toolRows', zh('隐藏对话里的工具行', 'Hide the transcript tool rows')),
+      checkbox(
+        'hideActivityRow',
+        zh('隐藏气泡下方的状态行', 'Hide the activity row under the bubble')
+      ),
       checkbox('bubbleGlow', zh('本轮气泡的边缘呼吸光', 'Breathing edge on the current bubble')),
       number(
         'glowMs',
@@ -559,9 +598,6 @@ export default {
   id: ID,
   name: 'Turn indicator',
   register(ctx) {
-    const instance = {}
-    owner = instance
-
     // Preferences are read as soon as the storage door exists; before that the
     // module carried the defaults.
     store = ctx.storage
@@ -569,14 +605,13 @@ export default {
 
     // Hides every tool row in the transcript. The "N files changed" card that
     // closes out a turn (`[data-slot=aui_changed-files]`) is deliberately left
-    // alone. Idempotent by id: a hot reload re-runs register() without
-    // duplicating the element.
+    // alone.
     let styleEl = null
     let unsubscribePrefs = null
 
     if (typeof document !== 'undefined') {
-      // Ids are unique per window, but the CONTENT must be rewritten on every
-      // register(): a hot reload re-runs this with a new rule set, and a
+      // Ids are unique per window, and the CONTENT is rewritten on every
+      // register(): a reload re-evaluates the module with a new rule set, and a
       // cached element would keep serving the old text.
       let style = document.getElementById('turn-indicator-hide-changes')
 
@@ -602,17 +637,15 @@ export default {
       // The <style> is not a registered contribution, so disabling the plugin
       // would leave it in the document until the window reloads. Tie it to the
       // plugin's own lifetime instead: dispose on disable/reload, and the next
-      // register() puts it back — but only while THIS instance still owns the id,
-      // or the old dispose would remove the replacement's element (same id).
+      // register() creates it again (a reload disposes this incarnation before
+      // the next one runs, so nothing here can strip its replacement's rules).
       if (typeof ctx.onDispose === 'function') {
         ctx.onDispose(() => {
           if (unsubscribePrefs) {
             unsubscribePrefs()
           }
 
-          if (owner === instance) {
-            style.remove()
-          }
+          style.remove()
         })
       }
 
@@ -683,8 +716,6 @@ export default {
       pendingBySession[key] = next > 0 ? next : 0
     }
 
-    const pendingCount = () => Object.values(pendingBySession).reduce((sum, n) => sum + n, 0)
-
     /** Drop counts — one session's, or every session's. */
     const resetPending = session => {
       for (const key of Object.keys(pendingBySession)) {
@@ -695,7 +726,7 @@ export default {
     }
 
     let lastLiveAt = 0
-    let chainRunning = false
+    let closeArmed = false
 
     // ── display layer: tag the bubbles of the live turn ─────────────────────
     const clearGlow = () => {
@@ -764,10 +795,12 @@ export default {
      *  transcript, write only the difference, and let the stylesheet decide when
      *  the pulse shows. Gated on `toolRows` because the row it repairs is only
      *  missing while this plugin is hiding the tool rows that would have
-     *  narrated the same wait, and on `$turn` so a finished turn never leaves a
-     *  square behind. */
+     *  narrated the same wait; on `hideActivityRow` because a hidden row needs no
+     *  repair (and tagging one would keep the repaint pass querying for it every
+     *  time the transcript mutates); and on `$turn` so a finished turn never
+     *  leaves a square behind. */
     const paintActivity = () => {
-      if (!prefs().toolRows || !$turn.get()) {
+      if (!prefs().toolRows || prefs().hideActivityRow || !$turn.get()) {
         clearActivity()
 
         return
@@ -801,9 +834,30 @@ export default {
       }
     }
 
+    /** Debounced repaint, driven by the transcript's own mutations (see the
+     *  MutationObserver below) instead of a polling tick: a new assistant
+     *  segment or tool row mounting mid-turn is the only thing that makes the
+     *  tag pass produce a different answer. */
+    let repaintPending = false
+    const scheduleRepaint = () => {
+      if (repaintPending) {
+        return
+      }
+
+      repaintPending = true
+      ctx.setTimeout(() => {
+        repaintPending = false
+
+        if ($turn.get()) {
+          paintGlow()
+          paintActivity()
+        }
+      }, REPAINT_MS)
+    }
+
     // Saved settings land immediately: the rules are one string, so a change is
     // one write, plus a re-tag when the glow was just switched on (its attribute
-    // is only painted on a latch tick). Subscribed HERE rather than up in the
+    // is only painted by a repaint. Subscribed HERE rather than up in the
     // stylesheet block: nanostores fires a new listener immediately, so an earlier
     // subscription would reach paintGlow before its `const` is initialized.
     unsubscribePrefs = $prefs.subscribe(() => {
@@ -815,18 +869,26 @@ export default {
       paintActivity()
     })
 
-    /** Whether a turn is running ANYWHERE. `busy` follows TILE FOCUS, so it drops
-     *  the moment the user clicks another pane mid-turn, and a stream hiccup or a
-     *  gateway reconnect can drop it too — each of those used to close the row
-     *  over a turn that was still running. `awaitingResponse` covers the window
-     *  between the send and the first assistant payload; any session mid-turn
-     *  covers focus moving away from the chat being counted. */
-    const sessionBusy = () => {
+    /** Whether the FOCUSED chat has anything in flight.
+     *
+     *  Deliberately not `busy` alone: that flag follows TILE FOCUS, drops
+     *  between two tool calls and across a message boundary inside one turn, and
+     *  a stream hiccup drops it too — each of those used to close the row over a
+     *  turn that was still running. `awaitingResponse` covers the window between
+     *  the send and the first assistant payload; the focused session's own
+     *  in-flight tool calls cover the gaps in between.
+     *
+     *  Deliberately not EVERY session either: `composer.top` is one pane's strip,
+     *  so a background bot / Kanban turn — or another tile — must not narrate
+     *  itself in the chat the user is typing in. */
+    const focusedLive = () => {
       if (host.state.busy.get() || host.state.awaitingResponse.get()) {
         return true
       }
 
-      return Object.values(host.state.busyBySession.get() || {}).some(Boolean)
+      const focused = host.state.focusedSessionId.get()
+
+      return Boolean(focused && ((host.state.busyBySession.get() || {})[focused] || pendingBySession[focused] > 0))
     }
 
     /** The FOCUSED chat's own turn, for the "new turn starts clean" reset. */
@@ -836,48 +898,54 @@ export default {
       return Boolean(host.state.busy.get() || (focused && (host.state.busyBySession.get() || {})[focused]))
     }
 
-    const settle = () => {
-      chainRunning = false
+    /** One timer per close window, not a 400 ms tick: nothing here needs
+     *  per-tick work (the repaint hangs off the transcript's mutations), so the
+     *  latch costs one wake-up per `settleMs` for as long as a turn is open. */
+    const armClose = (ms = prefs().settleMs) => {
+      if (closeArmed) {
+        return
+      }
+
+      closeArmed = true
+      ctx.setTimeout(close, Math.max(0, ms))
+    }
+
+    const close = () => {
+      closeArmed = false
 
       if (!$turn.get()) {
         return
       }
 
       // A gateway that still reports a turn IS a live signal, and it has to
-      // refresh the clock: otherwise the close window is measured from the last
-      // EVENT, so a turn with a long silent stretch (a tool running, a slow
-      // provider) closes the instant `busy` blinks false for a hiccup.
-      if (sessionBusy() || pendingCount() > 0) {
+      // refresh the clock: otherwise the window is measured from the last EVENT,
+      // so a turn with a long silent stretch (a tool running, a slow provider)
+      // closes the instant `busy` blinks false for a hiccup.
+      if (focusedLive()) {
         lastLiveAt = Date.now()
-        // The same tick re-tags the newest turn pair: assistant segments mount as
-        // the turn progresses, so one pass at the busy edge would miss later ones.
-        paintGlow()
-        paintActivity()
-        chainRunning = true
-        ctx.setTimeout(settle, CHAIN_MS)
+        armClose()
 
         return
       }
 
-      if (Date.now() - lastLiveAt >= prefs().settleMs) {
-        $turn.set(false)
-        clearGlow()
-        clearActivity()
-        // Nothing is live by definition here, so a count left over from a dropped
-        // `tool.complete` (or a gateway hiccup) is garbage — clear it, or the next
-        // turn starts latched open.
-        resetPending()
+      const remaining = prefs().settleMs - (Date.now() - lastLiveAt)
+
+      if (remaining > 0) {
+        armClose(remaining)
 
         return
       }
 
-      chainRunning = true
-      paintGlow()
-      paintActivity()
-      ctx.setTimeout(settle, CHAIN_MS)
+      $turn.set(false)
+      clearGlow()
+      clearActivity()
+      // Nothing is live by definition here, so a count left over from a dropped
+      // `tool.complete` (or a gateway hiccup) is garbage — clear it, or the next
+      // turn starts latched open.
+      resetPending()
     }
 
-    /** Open (or keep open) the turn; the row stays mounted until settle() closes it. */
+    /** Open (or keep open) the turn; `close()` ends it. */
     const live = () => {
       lastLiveAt = Date.now()
 
@@ -887,9 +955,56 @@ export default {
         paintActivity()
       }
 
-      if (!chainRunning) {
-        chainRunning = true
-        ctx.setTimeout(settle, CHAIN_MS)
+      armClose()
+    }
+
+    // The transcript mounting a new turn pair / activity row is the only thing
+    // that changes what the tag pass should paint mid-turn, so it drives the
+    // repaint directly instead of being polled for.
+    const observer =
+      typeof document !== 'undefined' && typeof MutationObserver !== 'undefined'
+        ? new MutationObserver(() => {
+            if ($turn.get()) {
+              scheduleRepaint()
+            }
+          })
+        : null
+
+    observer?.observe(document.body, { childList: true, subtree: true })
+
+    /** Rising-edge bookkeeping for the focused chat.
+     *
+     *  Reading it on EVERY notification was a bug: `$busyBySession` is a computed
+     *  that hands out a fresh object on every session-store write (token usage,
+     *  heartbeats, tool activity), so an unconditional reset zeroed the focused
+     *  chat's in-flight tool count and dropped its label back to 思考中 while a
+     *  tool was still running. The count follows the CALL, so only a genuine
+     *  not-busy → busy edge starts a clean slate. */
+    let wasFocusedBusy = focusedBusy()
+    let lastFocused = host.state.focusedSessionId.get()
+
+    const syncBusy = () => {
+      const focused = host.state.focusedSessionId.get()
+
+      if (focused !== lastFocused) {
+        // Focus moved: the LABEL is stale, the counts are not.
+        lastFocused = focused
+        setActivity('')
+      }
+
+      const busyNow = focusedBusy()
+
+      if (busyNow && !wasFocusedBusy) {
+        // A new turn starts from a clean slate: no label carried over from the
+        // last turn's last tool call, and no count stranded on THIS chat.
+        resetPending(focused)
+        setActivity('')
+      }
+
+      wasFocusedBusy = busyNow
+
+      if (focusedLive()) {
+        live()
       }
     }
 
@@ -946,30 +1061,25 @@ export default {
       }
     })
 
-    // The turn is over when the gateway says so — but only the settle chain
-    // decides when the row goes away, so a message.complete mid-turn (reply →
-    // tool → reply) clears the label without closing the turn.
-    ctx.onEvent('message.complete', () => setActivity(''))
+    // The turn is over when the gateway says so — but only `close()` decides
+    // when the row goes away, so a message.complete mid-turn (reply → tool →
+    // reply) clears the label without closing the turn. Focus- and replay-gated
+    // like every other signal: another chat's completion, or an old frame
+    // re-sent on reconnect, must not wipe THIS chat's label.
+    ctx.onEvent('message.complete', event => {
+      if (event.replayed || !isMine(event)) {
+        return
+      }
+
+      setActivity('')
+    })
 
     const unsubscribe = [
       host.state.busy,
       host.state.busyBySession,
       host.state.focusedSessionId,
       host.state.awaitingResponse
-    ].map(state =>
-      state.subscribe(() => {
-        if (focusedBusy()) {
-          // A new turn starts from a clean slate: no label carried over from the
-          // last turn's last tool call, and no count stranded on THIS chat.
-          resetPending(host.state.focusedSessionId.get())
-          setActivity('')
-        }
-
-        if (sessionBusy()) {
-          live()
-        }
-      })
-    )
+    ].map(state => state.subscribe(syncBusy))
 
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(() => {
@@ -977,21 +1087,19 @@ export default {
           off()
         }
 
-        // Only the owner may clear the shared latch (see `owner`).
-        if (owner === instance) {
-          owner = null
-          chainRunning = false
-          resetPending()
-          $turn.set(false)
-          clearGlow()
-          clearActivity()
-        }
+        observer?.disconnect()
+        closeArmed = false
+        resetPending()
+        $turn.set(false)
+        clearGlow()
+        clearActivity()
       })
     }
 
     // The plugin can be enabled mid-turn, and a session can already be busy.
-    if (sessionBusy()) {
+    if (focusedLive()) {
       live()
     }
+
   }
 }
