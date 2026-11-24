@@ -1,5 +1,7 @@
 /**
- * Turn indicator — a plugin-only replacement for the tail status row.
+ * Turn indicator — one plugin for what the transcript chrome was missing: the
+ * composer status row (below), the `::turn{}` inline twin, hiding every tool row,
+ * and the breathing glow on the bubble of the turn in progress.
  *
  * Why: the built-in row (`[data-slot=aui_response-loading]` /
  * `[data-slot=aui_turn-activity]`) hides itself for TURN_QUIET_S after any
@@ -8,10 +10,10 @@
  * from the moment the focused chat starts working until it stops, with a label
  * and a live timer, without touching core code.
  *
- * Placement: `composer.underside` — the chrome-free strip directly below the
- * composer, i.e. at the bottom of the conversation. The contribution is
- * registered ONLY while the turn is working (disposer on idle), so the strip
- * is empty:hidden and takes no space when the chat is idle.
+ * Placement: `composer.top` — the full-width line inside the composer card,
+ * directly above the textarea; it renders null while the chat is idle, so the
+ * slot's `empty:hidden` wrapper leaves no gap. A second contribution renders
+ * the `::turn{}` twin inline in the transcript.
  *
  * Data: host.state atoms + their events. `busy` is the focused chat's own flag
  * and can lag a tab switch, so the per-session map covers a chat that is still
@@ -22,9 +24,9 @@
  * Only @hermes/plugin-sdk, react and react/jsx-runtime resolve.
  */
 
-import { useEffect, useRef, useState } from 'react'
-import { jsx } from 'react/jsx-runtime'
-import { atom, host, useValue } from '@hermes/plugin-sdk'
+import { useEffect, useState } from 'react'
+import { jsx, jsxs } from 'react/jsx-runtime'
+import { atom, host, useValue, Button, Input } from '@hermes/plugin-sdk'
 
 const ID = 'turn-indicator'
 
@@ -50,6 +52,166 @@ const label = () => zh('思考中', 'Thinking')
  * strip for every token.
  */
 const $activity = atom('')
+
+/**
+ * Whether the row is mounted. NOT the same thing as the gateway's `busy`: that
+ * flag drops between two tool calls, while a long tool runs, and across a
+ * message boundary inside one turn — and every drop unmounted the row mid-turn.
+ * The turn is held open by its own live signals (`busy`, a tool call in flight,
+ * any streaming delta) and closed only once nothing has been live for
+ * SETTLE_MS, so the row is continuous for the whole turn.
+ */
+const $turn = atom(false)
+
+// ── preferences (ctx.storage) ────────────────────────────────────────────
+// Everything a user could disagree with is a preference, edited in
+// Settings ▸ Plugins ▸ Turn indicator and persisted per profile. Read through a
+// COERCING reader: a hand-edited or half-written record must not poison the row.
+
+const PREF_KEY = 'prefs'
+const PREF_DEFAULTS = {
+  toolRows: true,
+  bubbleGlow: true,
+  glowMs: 1200,
+  glowStrength: 55,
+  settleMs: 3000,
+  inlineDirective: true
+}
+const GLOW_MS_MIN = 400
+const GLOW_MS_MAX = 4000
+const STRENGTH_MIN = 5
+const STRENGTH_MAX = 100
+const SETTLE_MIN_MS = 500
+const SETTLE_MAX_MS = 20000
+
+const clampInt = (value, min, max, fallback) => {
+  const n = Math.round(Number(value))
+
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback
+}
+
+const asBool = (value, fallback) => (typeof value === 'boolean' ? value : fallback)
+
+let store = null
+
+function readPrefs() {
+  let raw = {}
+
+  try {
+    raw = (store && store.get(PREF_KEY, {})) || {}
+  } catch (error) {
+    console.warn('[turn-indicator] prefs', error instanceof Error ? error.message : error)
+  }
+
+  return {
+    toolRows: asBool(raw.toolRows, PREF_DEFAULTS.toolRows),
+    bubbleGlow: asBool(raw.bubbleGlow, PREF_DEFAULTS.bubbleGlow),
+    glowMs: clampInt(raw.glowMs, GLOW_MS_MIN, GLOW_MS_MAX, PREF_DEFAULTS.glowMs),
+    glowStrength: clampInt(raw.glowStrength, STRENGTH_MIN, STRENGTH_MAX, PREF_DEFAULTS.glowStrength),
+    settleMs: clampInt(raw.settleMs, SETTLE_MIN_MS, SETTLE_MAX_MS, PREF_DEFAULTS.settleMs),
+    inlineDirective: asBool(raw.inlineDirective, PREF_DEFAULTS.inlineDirective)
+  }
+}
+
+/** Persist, clamped on the way IN as well as on the way out. */
+function savePrefs(next) {
+  const clean = readPrefsFrom(next)
+
+  try {
+    if (store) {
+      store.set(PREF_KEY, clean)
+    }
+  } catch (error) {
+    console.warn('[turn-indicator] prefs save', error instanceof Error ? error.message : error)
+  }
+
+  // The atom is what the running instance reads (CSS string, latch window, the
+  // inline capsule's render), so a saved record has to land in it too — the store
+  // write alone changes nothing until the next register().
+  $prefs.set(clean)
+
+  return clean
+}
+
+/** `readPrefs`' coercion over an in-memory draft (the settings page's shape). */
+function readPrefsFrom(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {}
+
+  return {
+    toolRows: asBool(source.toolRows, PREF_DEFAULTS.toolRows),
+    bubbleGlow: asBool(source.bubbleGlow, PREF_DEFAULTS.bubbleGlow),
+    glowMs: clampInt(source.glowMs, GLOW_MS_MIN, GLOW_MS_MAX, PREF_DEFAULTS.glowMs),
+    glowStrength: clampInt(source.glowStrength, STRENGTH_MIN, STRENGTH_MAX, PREF_DEFAULTS.glowStrength),
+    settleMs: clampInt(source.settleMs, SETTLE_MIN_MS, SETTLE_MAX_MS, PREF_DEFAULTS.settleMs),
+    inlineDirective: asBool(source.inlineDirective, PREF_DEFAULTS.inlineDirective)
+  }
+}
+
+const $prefs = atom(PREF_DEFAULTS)
+
+const prefs = () => $prefs.get()
+
+/** Latch re-check cadence while a turn is open. */
+const CHAIN_MS = 400
+
+/**
+ * The live plugin instance. A hot reload registers the NEW instance BEFORE the
+ * old one disposes (`runtime-loader`: register then dispose), so an unguarded
+ * dispose tears down its own replacement: the stylesheet element has the same id
+ * (so the old `style.remove()` strips the new rules) and the latch below is one
+ * shared atom (so the old `$turn.set(false)` hides the new row). Both teardowns
+ * therefore run only while this instance is still the owner — which is also why
+ * saving plugin.js used to leave the row missing until the next gateway event.
+ */
+let owner = null
+
+/** Attribute on the turn pair whose bubbles breathe (`turn-glow`). */
+const GLOW_ATTR = 'turn-glow'
+
+/**
+ * Both jobs in one stylesheet — a plugin has no stylesheet of its own:
+ *   1. every tool row in the transcript is hidden, live and settled alike, since
+ *      the composer line above already narrates what is running;
+ *   2. the bubble of the turn in progress breathes — the user's own bubble, which
+ *      is the only element with a bubble shape (the assistant side is full-width
+ *      prose, so ringing it would mean inventing a rounded box around the whole
+ *      reading column, i.e. painting on the chrome around the bubble).
+ * Either job can be turned off in settings; the built string is what the style
+ * element carries, so a change is one `textContent` write.
+ *
+ * `--ui-accent` keeps it on-theme; reduced motion needs no guard (core's blanket
+ * `!important` kill takes every animation out for a user who asks for it).
+ *
+ * The style ELEMENT id stays `turn-indicator-hide-changes` even though it now
+ * carries two jobs: renaming it strands the previous revision's element (its
+ * dispose is owner-guarded), and that stale element would keep serving the old
+ * rules.
+ */
+const buildCss = p => {
+  let css = ''
+
+  if (p.toolRows) {
+    css += '[data-slot="tool-block"] { display: none !important; }\n'
+  }
+
+  if (p.bubbleGlow) {
+    const soft = Math.max(2, Math.round(p.glowStrength / 3))
+
+    css +=
+      '@keyframes turn-glow-breathe {\n' +
+      `  from { box-shadow: 0 0 4px 0 color-mix(in srgb, var(--ui-accent) ${soft}%, transparent); }\n` +
+      `  to { box-shadow: 0 0 10px 2px color-mix(in srgb, var(--ui-accent) ${p.glowStrength}%, transparent); }\n` +
+      '}\n' +
+      `[data-${GLOW_ATTR}] .composer-human-message {\n` +
+      // `alternate` is what makes the loop seamless: the two ends ARE the two
+      // extremes, so the reversal continues the curve instead of jumping back to
+      // a third keyframe's value. One direction is half a cycle.
+      `  animation: turn-glow-breathe ${p.glowMs}ms ease-in-out infinite alternate;\n` +
+      '}\n'
+  }
+
+  return css
+}
 
 const setActivity = next => {
   if ($activity.get() !== next) {
@@ -124,21 +286,9 @@ function turnSeconds(since) {
 }
 
 function Indicator() {
-  const busy = useValue(host.state.busy)
-  const busyBySession = useValue(host.state.busyBySession)
-  const focusedSessionId = useValue(host.state.focusedSessionId)
+  const working = useValue($turn)
   const activity = useValue($activity)
-  const working = Boolean(busy || (focusedSessionId && (busyBySession || {})[focusedSessionId]))
 
-  // Publish the busy state on <html> so the stylesheet can reveal this chat's
-  // tool rows for the length of the turn (and take them away the moment it
-  // ends). A class on the document outlives per-message re-renders, which is
-  // what the streaming marker could not do.
-  useEffect(() => {
-    document.documentElement.dataset.turnWorking = working ? 'true' : 'false'
-  }, [working])
-
-  const boxRef = useRef(null)
   const [since, setSince] = useState(() => (working ? Date.now() : null))
   const [tick, setTick] = useState(0)
 
@@ -162,31 +312,9 @@ function Indicator() {
     return () => window.clearInterval(id)
   }, [working])
 
-  // Continuous pulse. WAAPI rather than a CSS keyframe: a plugin has no
-  // stylesheet of its own, and the app pauses its own CSS animations when the
-  // window is hidden while this cancellation is explicit.
-  useEffect(() => {
-    const el = boxRef.current
-
-    if (!el || typeof el.animate !== 'function') {
-      return
-    }
-
-    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
-      return
-    }
-
-    const animation = el.animate(
-      [
-        { opacity: 0.28, boxShadow: '0 0 0 0 var(--ui-accent)' },
-        { opacity: 1, boxShadow: '0 0 6px 1px var(--ui-accent)' },
-        { opacity: 0.28, boxShadow: '0 0 0 0 var(--ui-accent)' }
-      ],
-      { duration: 1500, iterations: Infinity, easing: 'ease-in-out' }
-    )
-
-    return () => animation.cancel()
-  }, [working])
+  // The square is deliberately STEADY: it used to breathe (opacity 0.28→1), and a
+  // square fading to 28% every 1.5s reads as the indicator blinking on and off.
+  // "Alive" is carried by the label and the ticking seconds instead.
 
   // `tick` exists to re-render once a second; the value itself is recomputed
   // from the clock so a paused/throttled interval cannot drift the label.
@@ -222,9 +350,9 @@ function Indicator() {
       pointerEvents: 'none'
     },
     children: [
-      jsx('span', { key: 'box', ref: boxRef, style: boxStyle }),
+      jsx('span', { key: 'box', style: boxStyle }),
       jsx('span', { key: 'label', children: text }),
-      working ? jsx('span', { key: 'timer', style: { opacity: 0.7 }, children: `${elapsed}s` }) : null
+      jsx('span', { key: 'timer', style: { opacity: 0.7 }, children: `${elapsed}s` })
     ]
   })
 }
@@ -242,7 +370,7 @@ function Indicator() {
  */
 function DirectiveLine({ attrs }) {
   const activity = useValue($activity)
-  const boxRef = useRef(null)
+  const settings = useValue($prefs)
   const [since] = useState(() => Date.now())
   const [, setTick] = useState(0)
 
@@ -251,31 +379,13 @@ function DirectiveLine({ attrs }) {
     return () => window.clearInterval(id)
   }, [])
 
-  useEffect(() => {
-    const el = boxRef.current
-
-    if (!el || typeof el.animate !== 'function') {
-      return
-    }
-
-    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
-      return
-    }
-
-    const animation = el.animate(
-      [
-        { opacity: 0.28, boxShadow: '0 0 0 0 var(--ui-accent)' },
-        { opacity: 1, boxShadow: '0 0 6px 1px var(--ui-accent)' },
-        { opacity: 0.28, boxShadow: '0 0 0 0 var(--ui-accent)' }
-      ],
-      { duration: 1500, iterations: Infinity, easing: 'ease-in-out' }
-    )
-
-    return () => animation.cancel()
-  }, [])
-
+  // Steady square, same as the composer line: no pulse, nothing to blink.
   const override = typeof attrs?.text === 'string' ? attrs.text.trim().slice(0, 60) : ''
   const seconds = Math.max(0, Math.floor((Date.now() - since) / 1000))
+
+  if (!settings.inlineDirective) {
+    return null
+  }
 
   return jsx('span', {
     'data-turn-indicator-inline': '',
@@ -298,9 +408,103 @@ function DirectiveLine({ attrs }) {
       userSelect: 'none'
     },
     children: [
-      jsx('span', { key: 'box', ref: boxRef, style: boxStyle }),
+      jsx('span', { key: 'box', style: boxStyle }),
       jsx('span', { key: 'label', children: override || activity || label() }),
       jsx('span', { key: 'timer', style: { opacity: 0.7 }, children: `${seconds}s` })
+    ]
+  })
+}
+
+// ── Settings ▸ Plugins ▸ Turn indicator ──────────────────────────────────
+// A LOCAL draft, written on Save: per-keystroke writes would push half-typed
+// numbers into live rules (and a cleared field would read as NaN → clamped).
+const HINT_STYLE = { fontSize: 11, color: 'var(--ui-text-tertiary)', lineHeight: 1.5 }
+const FIELD_LABEL_STYLE = { fontSize: 12, fontWeight: 500 }
+const FIELD_STYLE = { display: 'flex', flexDirection: 'column', gap: 4 }
+const CHECK_ROW_STYLE = { display: 'flex', alignItems: 'center', gap: 8 }
+const CHECKBOX_STYLE = { width: 14, height: 14, flex: '0 0 auto' }
+
+function SettingsPage() {
+  const settings = useValue($prefs)
+  const [draft, setDraft] = useState(settings)
+  const set = key => event => setDraft(previous => ({ ...previous, [key]: event.target.value }))
+  const toggle = key => event => setDraft(previous => ({ ...previous, [key]: event.target.checked }))
+  const checkbox = (key, text) =>
+    jsxs('label', {
+      style: CHECK_ROW_STYLE,
+      children: [
+        jsx('input', {
+          type: 'checkbox',
+          checked: Boolean(draft[key]),
+          onChange: toggle(key),
+          style: CHECKBOX_STYLE
+        }),
+        jsx('span', { style: FIELD_LABEL_STYLE, children: text })
+      ]
+    })
+  const number = (key, text, min, max) =>
+    jsxs('label', {
+      style: FIELD_STYLE,
+      children: [
+        jsx('span', { style: FIELD_LABEL_STYLE, children: text }),
+        jsx(Input, { type: 'number', min, max, value: draft[key], onChange: set(key) }),
+        jsx('span', {
+          style: HINT_STYLE,
+          children: zh(`允许范围 ${min}–${max}，超出会被夹到边界`, `Range ${min}–${max}; out-of-range values are clamped`)
+        })
+      ]
+    })
+
+  return jsxs('div', {
+    style: { display: 'flex', flexDirection: 'column', gap: 12, fontSize: 13 },
+    children: [
+      jsx('div', {
+        style: HINT_STYLE,
+        children: zh(
+          '按配置（profile）保存，保存后立即生效；恢复默认可随时退回。',
+          'Saved per profile and applied immediately; Reset restores the defaults.'
+        )
+      }),
+      checkbox('toolRows', zh('隐藏对话里的工具行', 'Hide the transcript tool rows')),
+      checkbox('bubbleGlow', zh('本轮气泡的边缘呼吸光', 'Breathing edge on the current bubble')),
+      number(
+        'glowMs',
+        zh('呼吸单程时长（ms）', 'Glow half-cycle (ms)'),
+        GLOW_MS_MIN,
+        GLOW_MS_MAX
+      ),
+      number(
+        'glowStrength',
+        zh('呼吸强度（%）', 'Glow strength (%)'),
+        STRENGTH_MIN,
+        STRENGTH_MAX
+      ),
+      number(
+        'settleMs',
+        zh('回合结束后收起延迟（ms）', 'Hold the row after the turn ends (ms)'),
+        SETTLE_MIN_MS,
+        SETTLE_MAX_MS
+      ),
+      checkbox('inlineDirective', zh('`::turn{}` 内联胶囊', 'The `::turn{}` inline capsule')),
+      jsxs('div', {
+        style: { display: 'flex', gap: 8, paddingTop: 4 },
+        children: [
+          jsx(Button, {
+            size: 'sm',
+            onClick: () => {
+              setDraft(savePrefs(draft))
+              host.notify({ kind: 'success', message: zh('已保存', 'Saved') })
+            },
+            children: zh('保存', 'Save')
+          }),
+          jsx(Button, {
+            size: 'sm',
+            variant: 'secondary',
+            onClick: () => setDraft(savePrefs(PREF_DEFAULTS)),
+            children: zh('恢复默认', 'Reset')
+          })
+        ]
+      })
     ]
   })
 }
@@ -309,10 +513,21 @@ export default {
   id: ID,
   name: 'Turn indicator',
   register(ctx) {
-    // Hide the transcript's "N files changed" card that closes out a turn
-    // (`[data-slot=aui_changed-files]`, changed-files-card.tsx). It has no
-    // config gate in core, so the only user-level way to drop it is a rule.
-    // Idempotent by id: a hot reload re-runs register() without duplicating it.
+    const instance = {}
+    owner = instance
+
+    // Preferences are read as soon as the storage door exists; before that the
+    // module carried the defaults.
+    store = ctx.storage
+    $prefs.set(readPrefs())
+
+    // Hides every tool row in the transcript. The "N files changed" card that
+    // closes out a turn (`[data-slot=aui_changed-files]`) is deliberately left
+    // alone. Idempotent by id: a hot reload re-runs register() without
+    // duplicating the element.
+    let styleEl = null
+    let unsubscribePrefs = null
+
     if (typeof document !== 'undefined') {
       // Ids are unique per window, but the CONTENT must be rewritten on every
       // register(): a hot reload re-runs this with a new rule set, and a
@@ -331,23 +546,28 @@ export default {
       // `tool-block` is every tool row (reads, searches, commands, edits) AND
       // the row's inline `tool-progress` span (fallback.tsx:362) — one rule
       // covers both, since the progress text lives inside the row's header.
-      // Approval cards are NOT touched — the user has to answer those.
-      style.textContent =
-        // settled history: no tool rows at all
-        '[data-slot="tool-block"] { display: none !important; }\n' +
-        // …while THIS chat is working, show them. Driven by the plugin's own
-        // busy signal (`html[data-turn-working]`), not by the per-message
-        // streaming marker: core only stamps that marker on the placeholder
-        // bubble, so tool-call segments that settle between calls lost their
-        // rows mid-turn — the "执行命令 but no steps" bug.
-        'html[data-turn-working="true"] [data-slot="tool-block"] { display: block !important; }'
+      // No exception for the live turn: the composer line already narrates
+      // what is running, so the rows are noise in settled history and mid-turn
+      // alike. Approval cards are NOT touched — the user has to answer those.
+      // The bubble glow rides in the same stylesheet — see buildCss above.
+      style.textContent = buildCss(prefs())
+      styleEl = style
 
       // The <style> is not a registered contribution, so disabling the plugin
       // would leave it in the document until the window reloads. Tie it to the
       // plugin's own lifetime instead: dispose on disable/reload, and the next
-      // register() puts it back.
+      // register() puts it back — but only while THIS instance still owns the id,
+      // or the old dispose would remove the replacement's element (same id).
       if (typeof ctx.onDispose === 'function') {
-        ctx.onDispose(() => style.remove())
+        ctx.onDispose(() => {
+          if (unsubscribePrefs) {
+            unsubscribePrefs()
+          }
+
+          if (owner === instance) {
+            style.remove()
+          }
+        })
       }
 
     }
@@ -375,7 +595,20 @@ export default {
       }
     })
 
-    // ── Live label ───────────────────────────────────────────────────────────
+    // Settings ▸ Plugins ▸ Turn indicator — the knobs below are the same values
+    // the latch and buildCss read, so an edit lands on the running instance.
+    if (typeof ctx.registerSettingsPage === 'function') {
+      ctx.registerSettingsPage({
+        id: 'prefs',
+        // A product name in both bundles, so the rail label stays literal.
+        title: 'Turn indicator',
+        icon: 'pulse',
+        order: 70,
+        render: () => jsx(SettingsPage, {})
+      })
+    }
+
+    // ── Live label + turn latch ──────────────────────────────────────────────
     // Gateway events for the FOCUSED chat only: the stream is per-gateway, so a
     // tool row from another tab would relabel this one. `replayed` frames are
     // old turns re-sent on reconnect — never live activity.
@@ -385,54 +618,223 @@ export default {
       return !focused || !eventSession || focused === eventSession
     }
 
-    ctx.onEvent('tool.start', event => {
-      if (isMine(event) && !event.replayed) {
-        setActivity(describeTool(event.payload))
+    /** A tool call in flight is live even when the gateway is not `busy` — it is
+     *  exactly the gap that used to unmount the row. */
+    let pendingTools = 0
+    let lastLiveAt = 0
+    let chainRunning = false
+
+    // ── display layer: tag the bubbles of the live turn ─────────────────────
+    const clearGlow = () => {
+      for (const el of document.querySelectorAll(`[data-${GLOW_ATTR}]`)) {
+        el.removeAttribute(`[data-${GLOW_ATTR}]`)
       }
+    }
+
+    /** Idempotent, and it writes only the DIFFERENCE: re-adding the attribute to
+     *  a node that already carries it restarts its CSS animation, which is what
+     *  made the breathing hitch. Skips a transcript that is mounted but not laid
+     *  out (preloaded and tile panes), and takes its last turn pair in document
+     *  order — a turn pair is created with the user message and holds every
+     *  assistant segment, so one node covers the whole turn. */
+    const paintGlow = () => {
+      if (!prefs().bubbleGlow) {
+        clearGlow()
+
+        return
+      }
+
+      const targets = new Set()
+
+      for (const thread of document.querySelectorAll('[data-slot="thread"]')) {
+        if (thread.getClientRects().length === 0) {
+          continue
+        }
+
+        const pairs = thread.querySelectorAll('[data-slot="aui_turn-pair"]')
+        const newest = pairs[pairs.length - 1]
+
+        if (newest) {
+          targets.add(newest)
+        }
+      }
+
+      for (const el of document.querySelectorAll(`[data-${GLOW_ATTR}]`)) {
+        if (!targets.has(el)) {
+          el.removeAttribute(`data-${GLOW_ATTR}`)
+        }
+      }
+
+      for (const el of targets) {
+        if (!el.hasAttribute(`data-${GLOW_ATTR}`)) {
+          el.setAttribute(`data-${GLOW_ATTR}`, '')
+        }
+      }
+    }
+
+    // Saved settings land immediately: the rules are one string, so a change is
+    // one write, plus a re-tag when the glow was just switched on (its attribute
+    // is only painted on a latch tick). Subscribed HERE rather than up in the
+    // stylesheet block: nanostores fires a new listener immediately, so an earlier
+    // subscription would reach paintGlow before its `const` is initialized.
+    unsubscribePrefs = $prefs.subscribe(() => {
+      if (styleEl) {
+        styleEl.textContent = buildCss(prefs())
+      }
+
+      paintGlow()
     })
 
-    ctx.onEvent('tool.generating', event => {
-      if (isMine(event) && !event.replayed) {
-        setActivity(zh('准备工具参数', 'Preparing a tool call'))
+    /** Whether a turn is running ANYWHERE. `busy` follows TILE FOCUS, so it drops
+     *  the moment the user clicks another pane mid-turn, and a stream hiccup or a
+     *  gateway reconnect can drop it too — each of those used to close the row
+     *  over a turn that was still running. `awaitingResponse` covers the window
+     *  between the send and the first assistant payload; any session mid-turn
+     *  covers focus moving away from the chat being counted. */
+    const sessionBusy = () => {
+      if (host.state.busy.get() || host.state.awaitingResponse.get()) {
+        return true
       }
+
+      return Object.values(host.state.busyBySession.get() || {}).some(Boolean)
+    }
+
+    /** The FOCUSED chat's own turn, for the "new turn starts clean" reset. */
+    const focusedBusy = () => {
+      const focused = host.state.focusedSessionId.get()
+
+      return Boolean(host.state.busy.get() || (focused && (host.state.busyBySession.get() || {})[focused]))
+    }
+
+    const settle = () => {
+      chainRunning = false
+
+      if (!$turn.get()) {
+        return
+      }
+
+      // A gateway that still reports a turn IS a live signal, and it has to
+      // refresh the clock: otherwise the close window is measured from the last
+      // EVENT, so a turn with a long silent stretch (a tool running, a slow
+      // provider) closes the instant `busy` blinks false for a hiccup.
+      if (sessionBusy() || pendingTools > 0) {
+        lastLiveAt = Date.now()
+        // The same tick re-tags the newest turn pair: assistant segments mount as
+        // the turn progresses, so one pass at the busy edge would miss later ones.
+        paintGlow()
+        chainRunning = true
+        ctx.setTimeout(settle, CHAIN_MS)
+
+        return
+      }
+
+      if (Date.now() - lastLiveAt >= prefs().settleMs) {
+        $turn.set(false)
+        clearGlow()
+
+        return
+      }
+
+      chainRunning = true
+      paintGlow()
+      ctx.setTimeout(settle, CHAIN_MS)
+    }
+
+    /** Open (or keep open) the turn; the row stays mounted until settle() closes it. */
+    const live = () => {
+      lastLiveAt = Date.now()
+
+      if (!$turn.get()) {
+        $turn.set(true)
+        paintGlow()
+      }
+
+      if (!chainRunning) {
+        chainRunning = true
+        ctx.setTimeout(settle, CHAIN_MS)
+      }
+    }
+
+    const onLive = (type, handler) =>
+      ctx.onEvent(type, event => {
+        if (!isMine(event) || event.replayed) {
+          return
+        }
+
+        live()
+        handler?.(event)
+      })
+
+    onLive('tool.start', event => {
+      pendingTools += 1
+      setActivity(describeTool(event.payload))
     })
 
-    ctx.onEvent('tool.complete', event => {
-      if (isMine(event)) {
-        setActivity('')
-      }
+    onLive('tool.generating', () => setActivity(zh('准备工具参数', 'Preparing a tool call')))
+
+    onLive('tool.complete', () => {
+      pendingTools = Math.max(0, pendingTools - 1)
+      setActivity('')
     })
 
-    ctx.onEvent('message.delta', event => {
-      if (isMine(event) && !event.replayed) {
-        setActivity(zh('生成回复', 'Writing the reply'))
-      }
-    })
+    onLive('tool.progress')
+    onLive('message.start')
+    onLive('message.interim')
+    onLive('message.delta', () => setActivity(zh('生成回复', 'Writing the reply')))
+    onLive('thinking.delta', () => setActivity(''))
+    onLive('reasoning.delta')
 
-    ctx.onEvent('thinking.delta', event => {
-      if (isMine(event) && !event.replayed) {
-        setActivity('')
-      }
-    })
-
-    ctx.onEvent('status.update', event => {
-      if (isMine(event) && event.payload?.kind === 'compacting') {
+    onLive('status.update', event => {
+      if (event.payload?.kind === 'compacting') {
         setActivity(zh('整理上下文', 'Summarizing the thread'))
       }
     })
 
+    // The turn is over when the gateway says so — but only the settle chain
+    // decides when the row goes away, so a message.complete mid-turn (reply →
+    // tool → reply) clears the label without closing the turn.
     ctx.onEvent('message.complete', () => setActivity(''))
 
-    // A new turn starts from a clean slate: no label carried over from the last
-    // turn's last tool call.
-    const unsubscribeBusy = host.state.busy.subscribe(isBusy => {
-      if (isBusy) {
-        setActivity('')
-      }
-    })
+    const unsubscribe = [
+      host.state.busy,
+      host.state.busyBySession,
+      host.state.focusedSessionId,
+      host.state.awaitingResponse
+    ].map(state =>
+      state.subscribe(() => {
+        if (focusedBusy()) {
+          // A new turn starts from a clean slate: no label carried over from the
+          // last turn's last tool call.
+          pendingTools = 0
+          setActivity('')
+        }
+
+        if (sessionBusy()) {
+          live()
+        }
+      })
+    )
 
     if (typeof ctx.onDispose === 'function') {
-      ctx.onDispose(unsubscribeBusy)
+      ctx.onDispose(() => {
+        for (const off of unsubscribe) {
+          off()
+        }
+
+        // Only the owner may clear the shared latch (see `owner`).
+        if (owner === instance) {
+          owner = null
+          chainRunning = false
+          pendingTools = 0
+          $turn.set(false)
+          clearGlow()
+        }
+      })
+    }
+
+    // The plugin can be enabled mid-turn, and a session can already be busy.
+    if (sessionBusy()) {
+      live()
     }
   }
 }
