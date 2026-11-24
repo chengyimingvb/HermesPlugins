@@ -133,13 +133,14 @@ function latchChecks() {
   const settleMs = Number(/settleMs: (\d+)/.exec(source)?.[1])
   const chainMs = Number(/const CHAIN_MS = (\d+)/.exec(source)?.[1])
   const glowAttr = /const GLOW_ATTR = '([^']+)'/.exec(source)?.[1]
+  const actAttr = /const ACT_ATTR = '([^']+)'/.exec(source)?.[1]
   const block = extract(source, [
-    'let pendingTools = 0',
+    'const pendingBySession = Object.create(null)',
     '    const onLive = (type, handler) =>'
   ])
 
-  if (!settleMs || !chainMs || !glowAttr || !block) {
-    fail('could not extract settleMs/CHAIN_MS/GLOW_ATTR/pendingTools…live() from the source')
+  if (!settleMs || !chainMs || !glowAttr || !actAttr || !block) {
+    fail('could not extract settleMs/CHAIN_MS/GLOW_ATTR/ACT_ATTR/pendingBySession…live() from the source')
 
     return
   }
@@ -153,11 +154,12 @@ let __bySession = {}
 let __turn = false
 let __now = 0
 let __timers = []
-let __prefs = { bubbleGlow: true, settleMs: ${settleMs} }
+let __prefs = { bubbleGlow: true, toolRows: true, settleMs: ${settleMs} }
 const $prefs = { get: () => __prefs, subscribe: () => () => {} }
 const prefs = () => __prefs
 const CHAIN_MS = ${chainMs}
 const GLOW_ATTR = '${glowAttr}'
+const ACT_ATTR = '${actAttr}'
 const Date = { now: () => __now }
 const host = { state: {
   busy: { get: () => __busy },
@@ -168,10 +170,42 @@ const host = { state: {
 const $turn = { get: () => __turn, set: value => { __turn = value } }
 const ctx = { setTimeout: (fn, ms) => { __timers.push({ at: __now + ms, fn }); return () => {} } }
 // The latch block also carries the glow's DOM layer, whose paint/tag pass runs on
-// the same tick. Empty answers keep it inert; the counter proves the tick is shared.
+// the same tick. One fake turn pair stands in for the transcript: it reports the
+// attribute honestly, so a removeAttribute call with the wrong name (the selector
+// [data-turn-glow] instead of the attribute name) leaves the tag on — exactly
+// the shipped bug that kept finished turns breathing.
 let __glowQueries = 0
+const fake = attr => {
+  let on = false
+  return {
+    node: {
+      hasAttribute: name => on && name === attr,
+      setAttribute: name => { if (name === attr) { on = true } },
+      removeAttribute: name => { if (name === attr) { on = false } }
+    },
+    isOn: () => on
+  }
+}
+const __glow = fake('data-' + GLOW_ATTR)
+const __act = fake('data-' + ACT_ATTR)
+const __thread = {
+  getClientRects: () => [1],
+  querySelectorAll: selector => (selector.includes('aui_turn-activity') ? [__act.node] : [__glow.node])
+}
 const document = {
-  querySelectorAll: () => { __glowQueries += 1; return [] },
+  querySelectorAll: selector => {
+    __glowQueries += 1
+
+    if (selector.includes('ti-live')) {
+      return __act.isOn() ? [__act.node] : []
+    }
+
+    if (selector.includes('turn-glow')) {
+      return __glow.isOn() ? [__glow.node] : []
+    }
+
+    return selector.includes('data-slot="thread"') ? [__thread] : []
+  },
   querySelector: () => null
 }
 
@@ -180,12 +214,21 @@ ${block}
 return {
   live,
   settle,
+  paintGlow,
+  clearGlow,
+  paintActivity,
+  clearActivity,
   glowQueries: () => __glowQueries,
+  glowMarked: () => (__glow.isOn() ? 1 : 0),
+  activityMarked: () => __act.isOn(),
+  bumpPending,
+  pendingCount,
+  resetPending,
   setBusy: value => { __busy = value },
   setAwaiting: value => { __awaiting = value },
   setBySession: value => { __bySession = value },
   setFocused: value => { __focused = value },
-  setPending: value => { pendingTools = value },
+  setPending: value => { resetPending(); pendingBySession.s1 = value },
   setTurn: value => { __turn = value },
   setPrefs: value => { __prefs = { ...__prefs, ...value } },
   turn: () => __turn,
@@ -229,6 +272,7 @@ return {
   check(`still open ${settleMs - 100}ms after the last signal`, api.turn() === true)
   api.advance(chainMs * 2)
   check(`closed within ${chainMs * 2}ms of the settle window`, api.turn() === false)
+  check('closing the turn drops the glow tag', api.glowMarked() === 0)
 
   // C) the send→first-token window holds the row on its own.
   api.setAwaiting(true)
@@ -258,6 +302,60 @@ return {
   check('open just inside the settle window after the turn ends', api.turn() === true)
   api.advance(chainMs * 2)
   check('closed just after it', api.turn() === false)
+
+  // F) the tag is bound to the turn, not just to the pref: a settings save and a
+  //    register() both land on paintGlow, and at those moments the newest turn is
+  //    history. Tagging it there had the last bubble breathing for good.
+  api.setTurn(false)
+  api.clearGlow()
+  api.paintGlow()
+  check('an idle turn is not tagged by a prefs write', api.glowMarked() === 0)
+  api.setTurn(true)
+  api.paintGlow()
+  check('a live turn is tagged', api.glowMarked() === 1)
+  api.clearGlow()
+  check('clearGlow removes the attribute itself', api.glowMarked() === 0)
+
+  // G) the in-flight tool count follows the CALL, not the focused chat: a
+  //    `tool.complete` arriving for the chat the user has left must still
+  //    decrement, or the row stays latched open forever (the old shared counter).
+  api.resetPending()
+  api.bumpPending({ session_id: 's1' }, 1)
+  api.bumpPending({ session_id: 's2' }, 1)
+  check('two chats hold two counts', api.pendingCount() === 2)
+  api.bumpPending({ session_id: 's1' }, -1)
+  check('a complete for an unfocused chat still closes its own call', api.pendingCount() === 1)
+  api.bumpPending({ session_id: 's2' }, -5)
+  check('a stray complete never goes negative', api.pendingCount() === 0)
+  api.bumpPending({}, 1)
+  api.bumpPending({ session_id: 's3' }, 1)
+  api.resetPending('s3')
+  check('resetPending(session) drops only that chat', api.pendingCount() === 1)
+  api.resetPending()
+  check('resetPending() drops every chat', api.pendingCount() === 0)
+
+  // H) core's pulse row is re-armed only during a turn and only while this
+  //    plugin is the one hiding the tool rows that would have narrated the wait.
+  api.setTurn(false)
+  api.paintActivity()
+  check('an idle turn carries no pulse tag', api.activityMarked() === false)
+  api.setTurn(true)
+  api.paintActivity()
+  check('a live turn with hidden tool rows re-arms core pulse', api.activityMarked() === true)
+  api.setPrefs({ toolRows: false })
+  api.paintActivity()
+  check('tool rows visible → core narrates itself, no tag', api.activityMarked() === false)
+  api.setPrefs({ toolRows: true })
+  api.setTurn(false)
+  api.paintActivity()
+  check('the pulse tag goes away with the turn', api.activityMarked() === false)
+
+  // The counting has to sit OUTSIDE the focus filter, which is what `onLive`
+  // applies — registering these two through it is the bug being fixed here.
+  check(
+    'tool events are not routed through the focus filter',
+    !source.includes("onLive('tool.start'") && !source.includes("onLive('tool.complete'")
+  )
 }
 
 // ── 2b. the tool → label mapping ─────────────────────────────────────────────
@@ -320,7 +418,7 @@ function glowCssChecks() {
     return
   }
 
-  const buildCss = new Function(`const GLOW_ATTR = 'turn-glow'\n${block}\nreturn buildCss`)()
+  const buildCss = new Function(`const GLOW_ATTR = 'turn-glow'\nconst ACT_ATTR = 'ti-live'\n${block}\nreturn buildCss`)()
   const defaults = { toolRows: true, bubbleGlow: true, glowMs: 1200, glowStrength: 55 }
   const all = buildCss(defaults)
   // The tool-row rule keeps its `!important` (it has to beat Tailwind); the glow
@@ -342,6 +440,9 @@ function glowCssChecks() {
     `selector "${selector}"`
   )
   check('assistant content is not touched', !glow.includes('aui_assistant-message-content'))
+  // removeAttribute takes the attribute NAME; a bracketed selector is accepted
+  // silently and removes nothing, which left closed turns breathing.
+  check('no selector passed to removeAttribute', !source.includes('removeAttribute(`[data-'))
 
   // Seamless loop: the two ends are the two extremes, reversed by `alternate`.
   check('keyframes are from/to', /from\s*\{/.test(glow) && /to\s*\{/.test(glow))
@@ -350,6 +451,17 @@ function glowCssChecks() {
 
   // The settings page's knobs must actually reach the stylesheet.
   check('toolRows=false drops the hide rule', !buildCss({ ...defaults, toolRows: false }).includes('tool-block'))
+
+  // Core's own pulse row: restored for the windows core suppresses it, only
+  // while the tool rows are hidden, and never by fighting an !important.
+  const idle = all.slice(all.indexOf('[data-ti-live]'))
+  check('the core pulse row is re-armed for idle windows', idle.includes('data-state="idle"') && idle.includes('::before'))
+  check('the re-armed row does not use !important', !idle.includes('!important'))
+  check('the dither square is drawn with the theme colour', idle.includes('repeating-conic-gradient(currentColor') && idle.includes('border-radius: 2px'))
+  check(
+    'toolRows=false leaves core activity row alone',
+    !buildCss({ ...defaults, toolRows: false }).includes('aui_turn-activity')
+  )
   check('bubbleGlow=false drops the glow', !buildCss({ ...defaults, bubbleGlow: false }).includes('@keyframes'))
   check('glowMs reaches the animation', buildCss({ ...defaults, glowMs: 2000 }).includes('2000ms'))
   check('glowStrength reaches the keyframes', buildCss({ ...defaults, glowStrength: 80 }).includes('80%'))
@@ -375,6 +487,7 @@ return { readPrefsFrom, savePrefs, PREF_DEFAULTS }`
   )()
   const defaults = api.PREF_DEFAULTS
   const junk = api.readPrefsFrom({
+    composerRow: 0,
     toolRows: 'yes',
     bubbleGlow: false,
     glowMs: 'abc',
@@ -390,6 +503,11 @@ return { readPrefsFrom, savePrefs, PREF_DEFAULTS }`
   check('a too-large number clamps to the top', junk.glowStrength === 100)
   check('a negative number clamps to the bottom', junk.settleMs === 500)
   check('a non-boolean flag is not truthy-coerced', junk.inlineDirective === defaults.inlineDirective)
+  check('composerRow: an off switch survives', api.readPrefsFrom({ composerRow: false }).composerRow === false)
+  // The two places the new pref has to reach, or the toggle would save and do
+  // nothing: the badge renderer and the settings page's checkbox.
+  check('the composer row reads composerRow', source.includes('!settings.composerRow || !working'))
+  check('the settings page offers composerRow', source.includes("checkbox('composerRow'"))
   check('savePrefs clamps on the way in too', api.savePrefs({ glowMs: 1 }).glowMs === 400)
   check('junk input cannot throw', typeof api.savePrefs(null).glowMs === 'number')
 }

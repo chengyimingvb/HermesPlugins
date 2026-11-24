@@ -70,6 +70,7 @@ const $turn = atom(false)
 
 const PREF_KEY = 'prefs'
 const PREF_DEFAULTS = {
+  composerRow: true,
   toolRows: true,
   bubbleGlow: true,
   glowMs: 1200,
@@ -104,6 +105,7 @@ function readPrefs() {
   }
 
   return {
+    composerRow: asBool(raw.composerRow, PREF_DEFAULTS.composerRow),
     toolRows: asBool(raw.toolRows, PREF_DEFAULTS.toolRows),
     bubbleGlow: asBool(raw.bubbleGlow, PREF_DEFAULTS.bubbleGlow),
     glowMs: clampInt(raw.glowMs, GLOW_MS_MIN, GLOW_MS_MAX, PREF_DEFAULTS.glowMs),
@@ -138,6 +140,7 @@ function readPrefsFrom(raw) {
   const source = raw && typeof raw === 'object' ? raw : {}
 
   return {
+    composerRow: asBool(source.composerRow, PREF_DEFAULTS.composerRow),
     toolRows: asBool(source.toolRows, PREF_DEFAULTS.toolRows),
     bubbleGlow: asBool(source.bubbleGlow, PREF_DEFAULTS.bubbleGlow),
     glowMs: clampInt(source.glowMs, GLOW_MS_MIN, GLOW_MS_MAX, PREF_DEFAULTS.glowMs),
@@ -169,6 +172,18 @@ let owner = null
 const GLOW_ATTR = 'turn-glow'
 
 /**
+ * Attribute on the core activity row of the turn in progress (`ti-live`).
+ *
+ * Core's own row (`[data-slot=aui_turn-activity]`) drops to `sr-only` — and
+ * unmounts its pulse entirely (`{active && ...}`) — whenever a tool call is
+ * narrating the wait or the turn has been quiet for under `TURN_QUIET_S`. That
+ * is the right call while the tool rows are on screen, but this plugin hides
+ * every tool row, so those two gates were the whole turn with nothing to look
+ * at. The tag lets a stylesheet put the pulse back for exactly those windows.
+ */
+const ACT_ATTR = 'ti-live'
+
+/**
  * Both jobs in one stylesheet — a plugin has no stylesheet of its own:
  *   1. every tool row in the transcript is hidden, live and settled alike, since
  *      the composer line above already narrates what is running;
@@ -192,6 +207,33 @@ const buildCss = p => {
 
   if (p.toolRows) {
     css += '[data-slot="tool-block"] { display: none !important; }\n'
+    // With the rows gone, core's own pulse is the only thing left on the bubble
+    // side — and core suppresses it exactly while a tool call runs or the turn
+    // has been quiet for under 2s, i.e. most of a turn. Restore that row for
+    // those windows only: `data-state="active"` keeps core's real node (with its
+    // timer text), `idle` gets the same dither square this plugin draws above
+    // the composer. `clip`/`rect` are `sr-only`'s own declarations, overridden
+    // one by one because core ships it as a utility class.
+    css +=
+      `[data-${ACT_ATTR}][data-slot="aui_turn-activity"][data-state="idle"] {\n` +
+      '  position: static;\n' +
+      '  width: auto;\n' +
+      '  height: auto;\n' +
+      '  margin: 0;\n' +
+      '  overflow: visible;\n' +
+      '  clip: auto;\n' +
+      '  border-width: 0;\n' +
+      '}\n' +
+      `[data-${ACT_ATTR}][data-slot="aui_turn-activity"][data-state="idle"]::before {\n` +
+      "  content: '';\n" +
+      '  display: inline-block;\n' +
+      '  flex: 0 0 auto;\n' +
+      '  width: 12px;\n' +
+      '  height: 12px;\n' +
+      '  border-radius: 2px;\n' +
+      '  opacity: 0.8;\n' +
+      '  background: repeating-conic-gradient(currentColor 0% 25%, transparent 0% 50%) 0 0 / 0.125rem 0.125rem;\n' +
+      '}\n'
   }
 
   if (p.bubbleGlow) {
@@ -286,6 +328,7 @@ function turnSeconds(since) {
 }
 
 function Indicator() {
+  const settings = useValue($prefs)
   const working = useValue($turn)
   const activity = useValue($activity)
 
@@ -322,8 +365,10 @@ function Indicator() {
   const elapsed = turnSeconds(since)
 
   // Inline slot beside the "+" menu: idle renders nothing (the slot is a bare
-  // inline strip, not a host card that would be left empty).
-  if (!working) {
+  // inline strip, not a host card that would be left empty). The same goes for a
+  // user who turned the row off — the registration stays (a hot reload keeps it),
+  // only the render is gone.
+  if (!settings.composerRow || !working) {
     return null
   }
 
@@ -465,6 +510,7 @@ function SettingsPage() {
           'Saved per profile and applied immediately; Reset restores the defaults.'
         )
       }),
+      checkbox('composerRow', zh('显示输入框上方的状态行', 'Show the status row above the composer')),
       checkbox('toolRows', zh('隐藏对话里的工具行', 'Hide the transcript tool rows')),
       checkbox('bubbleGlow', zh('本轮气泡的边缘呼吸光', 'Breathing edge on the current bubble')),
       number(
@@ -619,15 +665,46 @@ export default {
     }
 
     /** A tool call in flight is live even when the gateway is not `busy` — it is
-     *  exactly the gap that used to unmount the row. */
-    let pendingTools = 0
+     *  exactly the gap that used to unmount the row.
+     *
+     *  Keyed by SESSION, and counted OUTSIDE the `isMine` filter: a tool that
+     *  started in one chat and finished after the user focused another pane used
+     *  to be counted on start and dropped on complete (the complete carried the
+     *  old session id), so the row and the glow stayed latched open forever. Only
+     *  the label is focus-scoped. */
+    const pendingBySession = Object.create(null)
+
+    const pendingKey = event => String(event?.session_id || 'unknown')
+
+    const bumpPending = (event, delta) => {
+      const key = pendingKey(event)
+      const next = (pendingBySession[key] || 0) + delta
+
+      pendingBySession[key] = next > 0 ? next : 0
+    }
+
+    const pendingCount = () => Object.values(pendingBySession).reduce((sum, n) => sum + n, 0)
+
+    /** Drop counts — one session's, or every session's. */
+    const resetPending = session => {
+      for (const key of Object.keys(pendingBySession)) {
+        if (!session || key === session) {
+          delete pendingBySession[key]
+        }
+      }
+    }
+
     let lastLiveAt = 0
     let chainRunning = false
 
     // ── display layer: tag the bubbles of the live turn ─────────────────────
     const clearGlow = () => {
       for (const el of document.querySelectorAll(`[data-${GLOW_ATTR}]`)) {
-        el.removeAttribute(`[data-${GLOW_ATTR}]`)
+        // The attribute NAME, not the selector: `[data-turn-glow]` is accepted
+        // by removeAttribute (Chrome does not throw on a bracketed name) and
+        // silently removes nothing, which left every closed turn's bubble
+        // breathing forever.
+        el.removeAttribute(`data-${GLOW_ATTR}`)
       }
     }
 
@@ -638,7 +715,11 @@ export default {
      *  order — a turn pair is created with the user message and holds every
      *  assistant segment, so one node covers the whole turn. */
     const paintGlow = () => {
-      if (!prefs().bubbleGlow) {
+      // `$turn` as well as the pref: this also runs on every prefs write (the
+      // settings page saves) and on register, where the newest turn is history.
+      // Tagging it there painted a breathing bubble on a finished turn, and the
+      // settle chain — the only thing that calls clearGlow — was not running.
+      if (!prefs().bubbleGlow || !$turn.get()) {
         clearGlow()
 
         return
@@ -672,6 +753,54 @@ export default {
       }
     }
 
+    // ── display layer: keep core's pulse alive while the tool rows are hidden ──
+    const clearActivity = () => {
+      for (const el of document.querySelectorAll(`[data-${ACT_ATTR}]`)) {
+        el.removeAttribute(`data-${ACT_ATTR}`)
+      }
+    }
+
+    /** Same shape as paintGlow: tag the NEWEST activity row of every laid-out
+     *  transcript, write only the difference, and let the stylesheet decide when
+     *  the pulse shows. Gated on `toolRows` because the row it repairs is only
+     *  missing while this plugin is hiding the tool rows that would have
+     *  narrated the same wait, and on `$turn` so a finished turn never leaves a
+     *  square behind. */
+    const paintActivity = () => {
+      if (!prefs().toolRows || !$turn.get()) {
+        clearActivity()
+
+        return
+      }
+
+      const targets = new Set()
+
+      for (const thread of document.querySelectorAll('[data-slot="thread"]')) {
+        if (thread.getClientRects().length === 0) {
+          continue
+        }
+
+        const rows = thread.querySelectorAll('[data-slot="aui_turn-activity"]')
+        const newest = rows[rows.length - 1]
+
+        if (newest) {
+          targets.add(newest)
+        }
+      }
+
+      for (const el of document.querySelectorAll(`[data-${ACT_ATTR}]`)) {
+        if (!targets.has(el)) {
+          el.removeAttribute(`data-${ACT_ATTR}`)
+        }
+      }
+
+      for (const el of targets) {
+        if (!el.hasAttribute(`data-${ACT_ATTR}`)) {
+          el.setAttribute(`data-${ACT_ATTR}`, '')
+        }
+      }
+    }
+
     // Saved settings land immediately: the rules are one string, so a change is
     // one write, plus a re-tag when the glow was just switched on (its attribute
     // is only painted on a latch tick). Subscribed HERE rather than up in the
@@ -683,6 +812,7 @@ export default {
       }
 
       paintGlow()
+      paintActivity()
     })
 
     /** Whether a turn is running ANYWHERE. `busy` follows TILE FOCUS, so it drops
@@ -717,11 +847,12 @@ export default {
       // refresh the clock: otherwise the close window is measured from the last
       // EVENT, so a turn with a long silent stretch (a tool running, a slow
       // provider) closes the instant `busy` blinks false for a hiccup.
-      if (sessionBusy() || pendingTools > 0) {
+      if (sessionBusy() || pendingCount() > 0) {
         lastLiveAt = Date.now()
         // The same tick re-tags the newest turn pair: assistant segments mount as
         // the turn progresses, so one pass at the busy edge would miss later ones.
         paintGlow()
+        paintActivity()
         chainRunning = true
         ctx.setTimeout(settle, CHAIN_MS)
 
@@ -731,12 +862,18 @@ export default {
       if (Date.now() - lastLiveAt >= prefs().settleMs) {
         $turn.set(false)
         clearGlow()
+        clearActivity()
+        // Nothing is live by definition here, so a count left over from a dropped
+        // `tool.complete` (or a gateway hiccup) is garbage — clear it, or the next
+        // turn starts latched open.
+        resetPending()
 
         return
       }
 
       chainRunning = true
       paintGlow()
+      paintActivity()
       ctx.setTimeout(settle, CHAIN_MS)
     }
 
@@ -747,6 +884,7 @@ export default {
       if (!$turn.get()) {
         $turn.set(true)
         paintGlow()
+        paintActivity()
       }
 
       if (!chainRunning) {
@@ -765,16 +903,34 @@ export default {
         handler?.(event)
       })
 
-    onLive('tool.start', event => {
-      pendingTools += 1
-      setActivity(describeTool(event.payload))
+    // Tool bookkeeping is deliberately NOT focus-scoped (see pendingBySession):
+    // the count follows the call, only the label follows the focused chat.
+    ctx.onEvent('tool.start', event => {
+      if (event.replayed) {
+        return
+      }
+
+      bumpPending(event, 1)
+
+      if (isMine(event)) {
+        live()
+        setActivity(describeTool(event.payload))
+      }
     })
 
     onLive('tool.generating', () => setActivity(zh('准备工具参数', 'Preparing a tool call')))
 
-    onLive('tool.complete', () => {
-      pendingTools = Math.max(0, pendingTools - 1)
-      setActivity('')
+    ctx.onEvent('tool.complete', event => {
+      if (event.replayed) {
+        return
+      }
+
+      bumpPending(event, -1)
+
+      if (isMine(event)) {
+        live()
+        setActivity('')
+      }
     })
 
     onLive('tool.progress')
@@ -804,8 +960,8 @@ export default {
       state.subscribe(() => {
         if (focusedBusy()) {
           // A new turn starts from a clean slate: no label carried over from the
-          // last turn's last tool call.
-          pendingTools = 0
+          // last turn's last tool call, and no count stranded on THIS chat.
+          resetPending(host.state.focusedSessionId.get())
           setActivity('')
         }
 
@@ -825,9 +981,10 @@ export default {
         if (owner === instance) {
           owner = null
           chainRunning = false
-          pendingTools = 0
+          resetPending()
           $turn.set(false)
           clearGlow()
+          clearActivity()
         }
       })
     }
