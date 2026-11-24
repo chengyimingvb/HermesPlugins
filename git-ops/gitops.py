@@ -248,10 +248,15 @@ def _porcelain(top: str, untracked: bool = True) -> dict:
       2 <XY> ... <path> NUL <origin> rename/copy: the original path is its own token
       u <XY> ... <path>              unmerged
       ? <path> / ! <path>            untracked / ignored
+
+    Untracked entries are always listed per FILE (``-uall``): git's normal walk collapses a
+    new directory into one ``dir/`` entry, which no caller can act on — the pane drew it as a
+    nameless row, and ``git add`` staged the files under it while the trailing-slash pathspec
+    never matched them again, so the commit then refused its own selection. Enumerating costs
+    ~15ms on a 20k-untracked-file tree, so every untracked read pays it.
     """
-    args = ["status", "--porcelain=v2", "--branch", "-z"]
-    if not untracked:
-        args.append("-uno")  # push/pull only need the branch header; skip the untracked walk
+    args = ["status", "--porcelain=v2", "--branch", "-z",
+            "-uall" if untracked else "-uno"]  # -uno: branch header only (push/pull)
     proc = _run(args, cwd=top, timeout=GIT_TIMEOUT["status"])
     if proc.returncode != 0:
         raise GitOpsError(proc.stderr.strip() or "git status failed")
@@ -448,15 +453,17 @@ def _stage(top: str, paths: list[str]) -> list[str]:
             "index already holds changes outside the selected paths: "
             + ", ".join(sorted(extras))
             + " — unstage them (git restore --staged <path>) or add them to paths")
-    # The mirror of ``extras``: every selected path that carries a change of its own (the
-    # target of a rename, never its source) must be in the index, so a selected path can
-    # never be dropped from the commit without an error.
+    # The mirror of ``extras``: every change a selected path carries (the target of a
+    # rename, never its source) must be in the index, so a selection can never be dropped
+    # from the commit without an error. Scope test, not equality: a selected directory —
+    # ``dir`` or git's own ``dir/`` spelling — carries every change under it.
     carrying = {entry["path"] for entry in files}
-    unstaged = [p for p in paths if p in carrying and not _in_scope(p, staged)]
+    unstaged = sorted({c for p in paths for c in carrying
+                       if _in_scope(c, [p]) and not _in_scope(c, staged)})
     if unstaged:
         raise GitOpsError(
             "selected paths carry a change the index does not hold: "
-            + ", ".join(sorted(unstaged)))
+            + ", ".join(unstaged))
     return staged
 
 

@@ -463,6 +463,34 @@ class GitOpsTests(unittest.TestCase):
                      cwd=self.fx.work, env=self.fx.env).stdout
         self.assertIn("D\tbatch-gone.txt", landed)
         self.assertIn("M\tbatch-keep.txt", landed)
+    def test_status_lists_untracked_files_inside_a_new_directory(self):
+        """新建目录不能塌成一个 ``dir/``：那样的路径在面板里是空名字，提交也对不上。"""
+        self.fx.write(self.fx.work, "fresh-dir/a.txt", "a\n")
+        self.fx.write(self.fx.work, "fresh-dir/nested/b.txt", "b\n")
+        try:
+            files = gitops.status(".", str(self.fx.work))["files"]
+            fresh = sorted(f["path"] for f in files if f["path"].startswith("fresh-dir"))
+            self.assertEqual(fresh, ["fresh-dir/a.txt", "fresh-dir/nested/b.txt"])
+            self.assertFalse([p for p in fresh if p.endswith("/")], fresh)
+        finally:
+            shutil.rmtree(self.fx.work / "fresh-dir", ignore_errors=True)
+
+    def test_commit_stages_the_files_of_a_new_directory(self):
+        """面板勾选的就是 status 给的文件路径：提交必须落地，不能报 index 不一致。"""
+        self.fx.write(self.fx.work, "pick-dir/a.txt", "a\n")
+        self.fx.write(self.fx.work, "pick-dir/nested/b.txt", "b\n")
+        picked = [f["path"] for f in gitops.status(".", str(self.fx.work))["files"]
+                  if f["path"].startswith("pick-dir")]
+        result = gitops.commit(".", picked, "feat: 增加 pick-dir 目录", str(self.fx.work))
+        self.assertEqual(sorted(result["files"]), ["pick-dir/a.txt", "pick-dir/nested/b.txt"])
+
+    def test_commit_accepts_a_directory_pathspec_with_a_trailing_slash(self):
+        """``dir/``（git 自己的写法）与 ``dir`` 等价：整目录提交两种写法都要能过。"""
+        for spelling, name in (("spell-a", "spell-a"), ("spell-b/", "spell-b")):
+            self.fx.write(self.fx.work, f"{name}/inner/c.txt", "c\n")
+            result = gitops.commit(".", [spelling], "feat: 新增 " + name + " 目录",
+                                   str(self.fx.work))
+            self.assertEqual(result["files"], [f"{name}/inner/c.txt"], spelling)
 
     def test_pull_advances_detached_submodule_to_its_gitlink(self):
         """detached 的子模块仍跟父级 gitlink 前进：修复不能削弱原来的建树语义。"""
