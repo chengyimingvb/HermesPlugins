@@ -89,7 +89,14 @@ def _inside(top: str, path: str) -> str:
     if not path:
         raise gitops.GitOpsError("path is required")
     target = os.path.normpath(os.path.join(top, path))
-    if os.path.commonpath([os.path.normcase(top), os.path.normcase(target)]) != os.path.normcase(top):
+    try:
+        inside = (os.path.commonpath([os.path.normcase(top), os.path.normcase(target)])
+                  == os.path.normcase(top))
+    except ValueError:
+        # commonpath refuses to compare paths on different drives (a C:\ path aimed at a
+        # repo living on D:) — an escape like any other, never a crash.
+        inside = False
+    if not inside:
         raise gitops.GitOpsError(f"path escapes the repository: {path}")
     return target
 

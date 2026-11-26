@@ -577,6 +577,124 @@ class GitOpsTests(unittest.TestCase):
                              env=self.fx.env).stdout.strip(), local)
         self.assertIn("subs/lib", result["submodules"]["on_branch"], result)
 
+    def test_commit_info_accepts_a_deleted_directory(self):
+        """被删目录（未暂存）也要能生成信息：commit 一直收它，check_paths 不能先拒。"""
+        work = str(self.fx.work)
+        self.fx.write(self.fx.work, "info-del/a.txt", "a\n")
+        self.fx.write(self.fx.work, "info-del/b.txt", "b\n")
+        gitops.commit(".", ["info-del"], "feat: 增加 info-del 目录", work)
+        shutil.rmtree(self.fx.work / "info-del")
+        info = gitops.commit_info(".", ["info-del"], work, FakeLlm())
+        self.assertTrue(info["header"])
+        # Land the deletion: leaving the fixture dirty would leak into later tests.
+        gitops.commit(".", ["info-del"], "chore: 删除 info-del 目录", work)
+
+    def test_commit_info_works_before_the_first_commit(self):
+        """Unborn HEAD（新 init 的仓库）也要能生成首次提交的信息：git log 失败即空历史。"""
+        root = Path(tempfile.mkdtemp(prefix="gitops-unborn-"))
+        try:
+            env = self.fx.env
+            repo = root / "fresh"
+            run("init", "-b", "main", str(repo), env=env)
+            (repo / "a.txt").write_text("hello\n", encoding="utf-8")
+            run("add", "a.txt", cwd=repo, env=env)
+            info = gitops.commit_info(".", ["a.txt"], str(repo), FakeLlm())
+            self.assertTrue(info["header"], info)
+            landed = gitops.auto_commit(".", ["a.txt"], "", str(repo), FakeLlm())
+            self.assertTrue(landed["sha"], landed)
+            self.assertEqual(run("log", "-1", "--format=%s", cwd=repo, env=env).stdout.strip(),
+                             "fix(core): 修正空引用")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_file_diff_shows_a_staged_file_without_head(self):
+        """没有 HEAD 时 `git diff HEAD` 会失败：退回索引对比，已暂存文件仍有正文。"""
+        root = Path(tempfile.mkdtemp(prefix="gitops-nodiff-"))
+        try:
+            env = self.fx.env
+            repo = root / "fresh"
+            run("init", "-b", "main", str(repo), env=env)
+            (repo / "a.txt").write_text("hello\n", encoding="utf-8")
+            run("add", "a.txt", cwd=repo, env=env)
+            top = gitops.toplevel(str(repo))
+            text, truncated = gitops.file_diff(top, "a.txt")
+            self.assertIn("+hello", text, text)
+            self.assertFalse(truncated)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_discard_never_deletes_a_staged_new_file(self):
+        """只 add 过、还没提交的新文件：放弃只取消暂存，绝不删除（restore --source=HEAD 会删）。"""
+        work = str(self.fx.work)
+        name = "keep-new.txt"
+        self.fx.write(self.fx.work, name, "brand new\n")
+        run("add", name, cwd=self.fx.work, env=self.fx.env)
+        try:
+            result = gitops.discard(".", [name], work)
+            self.assertEqual(result["skipped"], [name], result)
+            self.assertEqual(result["discarded"], [], result)
+            self.assertEqual(result["still_dirty"], [], result)
+            self.assertTrue((self.fx.work / name).exists())
+            self.assertEqual(run("status", "--porcelain", "--", name, cwd=self.fx.work,
+                                 env=self.fx.env).stdout.strip(), "?? " + name)
+        finally:
+            os.remove(self.fx.work / name)
+
+    def test_discard_undoes_a_staged_rename(self):
+        """选中改名行放弃：目标删掉、源恢复，整体回到 HEAD——只动目标会留下 ``D 源``。"""
+        work = str(self.fx.work)
+        self.fx.write(self.fx.work, "ren-src.txt", "keep me\n")
+        gitops.commit(".", ["ren-src.txt"], "feat: 增加改名源文件", work)
+        run("mv", "ren-src.txt", "ren-dst.txt", cwd=self.fx.work, env=self.fx.env)
+        result = gitops.discard(".", ["ren-dst.txt"], work)
+        self.assertEqual(sorted(result["discarded"]), ["ren-dst.txt", "ren-src.txt"], result)
+        self.assertEqual(result["still_dirty"], [], result)
+        self.assertTrue((self.fx.work / "ren-src.txt").exists())
+        self.assertFalse((self.fx.work / "ren-dst.txt").exists())
+        self.assertEqual(run("status", "--porcelain", "--", "ren-src.txt", "ren-dst.txt",
+                             cwd=self.fx.work, env=self.fx.env).stdout.strip(), "")
+
+    def test_pull_rebase_replays_local_commits_when_diverged(self):
+        """mode='rebase' 才是 diverge 的出口：ff 拒绝，rebase 把本地提交重放到上游之上。"""
+        origin = self.fx._bare("rebase-origin.git")
+        one = self.fx._clone(origin, "rebase-one")
+        self.fx.write(one, "seed.txt", "s\n")
+        run("add", "seed.txt", cwd=one, env=self.fx.env)
+        run("commit", "-m", "feat: seed", cwd=one, env=self.fx.env)
+        run("push", "-u", "origin", "main", cwd=one, env=self.fx.env)
+        two = self.fx._clone(origin, "rebase-two")
+        self.fx.write(one, "remote.txt", "r\n")
+        run("add", "remote.txt", cwd=one, env=self.fx.env)
+        run("commit", "-m", "feat: remote", cwd=one, env=self.fx.env)
+        run("push", cwd=one, env=self.fx.env)
+        self.fx.write(two, "local.txt", "l\n")
+        gitops.commit(".", ["local.txt"], "feat: 本地提交", str(two))
+        with self.assertRaises(gitops.GitOpsError) as ctx:
+            gitops.pull(".", str(two))
+        self.assertIn("mode='rebase'", str(ctx.exception))
+        result = gitops.pull(".", str(two), "rebase")
+        self.assertEqual(result["pulled"], 1, result)
+        self.assertEqual(result["behind"], 0, result)
+        self.assertEqual(result["ahead"], 1, result)  # 重放的本地提交，push 前领先 1
+        subjects = run("log", "--format=%s", "-5", cwd=two, env=self.fx.env).stdout
+        self.assertIn("feat: 本地提交", subjects)
+        self.assertIn("feat: remote", subjects)
+        self.assertTrue((two / "local.txt").exists())
+
+    def test_scan_reports_a_work_tree_it_cannot_read(self):
+        """读不了的仓库也要在列表里带 error 报出，不能静默消失。"""
+        root = Path(tempfile.mkdtemp(prefix="gitops-broken-"))
+        try:
+            broken = root / "broken"
+            broken.mkdir()
+            (broken / ".git").write_text("gitdir: /nonexistent/place\n", encoding="utf-8")
+            listing = gitops.scan([str(root)], 3, True)
+            entry = next((r for r in listing["repos"] if r["path"].endswith("/broken")), None)
+            self.assertIsNotNone(entry, listing)
+            self.assertIn("error", entry or {})
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     def test_commit_info_redacts_secrets(self):
         self.fx.write(self.fx.work, "secret.txt", "token = ghp_" + "a" * 30 + "\n")
         llm = FakeLlm()
