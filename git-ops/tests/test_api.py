@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from test_gitops import Fixture, FakeLlm  # noqa: E402
+from test_gitops import Fixture, FakeLlm, run  # noqa: E402
 
 BASE = "/api/plugins/git-ops"
 
@@ -104,6 +104,13 @@ def main() -> int:
         check("GET /diff refuses a path outside the repo",
               r.get("ok") is False and "escapes" in r["error"], r)
 
+        # An absolute path on another drive: commonpath raises there, the guard must still
+        # answer "escapes" rather than leaking a ValueError.
+        r = client.get(f"{BASE}/diff",
+                       params={"repo": ".", "path": "/outside/escape.txt", "cwd": work}).json()
+        check("GET /diff refuses an absolute path outside the repo",
+              r.get("ok") is False and "escapes" in r["error"], r)
+
         fx.write(fx.work, "my file.txt", "spaced\n")
         r = client.get(f"{BASE}/diff", params={"repo": ".", "path": "my file.txt", "cwd": work}).json()
         check("GET /diff handles a path with a space",
@@ -157,6 +164,20 @@ def main() -> int:
               and r["data"]["skipped"] == ["api-untracked.txt"]
               and (fx.work / "api-untracked.txt").exists(), r)
         (fx.work / "api-untracked.txt").unlink()
+
+        # A staged-but-never-committed file is a NEW file too: the same call must leave it
+        # on disk (unstaged) instead of deleting it.
+        fx.write(fx.work, "api-staged-new.txt", "n\n")
+        run("add", "api-staged-new.txt", cwd=fx.work, env=fx.env)
+        try:
+            r = client.post(f"{BASE}/discard", json={"repo": ".", "paths": ["api-staged-new.txt"],
+                                                     "cwd": work}).json()
+            check("POST /discard keeps a staged new file",
+                  r.get("ok") and r["data"]["discarded"] == []
+                  and r["data"]["skipped"] == ["api-staged-new.txt"]
+                  and (fx.work / "api-staged-new.txt").exists(), r)
+        finally:
+            (fx.work / "api-staged-new.txt").unlink()
 
         # GUI bridges (TortoiseGit + VS Code): stub the process so no window opens.
         calls = []

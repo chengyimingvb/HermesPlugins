@@ -170,12 +170,17 @@ def _kind(top: str) -> dict:
     return {"kind": "main", "parent": ""}  # a linked work tree keeps its own branch
 
 
-def _probe(top: str) -> Optional[dict]:
-    """One repo's light state: a single git call, plus a filesystem kind lookup."""
+def _probe(top: str) -> dict:
+    """One repo's light state: a single git call, plus a filesystem kind lookup.
+
+    A work tree git cannot read is still a work tree: it comes back with ``error`` set
+    instead of being dropped, so the pane can say why it is not answering.
+    """
     try:
         state = _porcelain(top)
-    except GitOpsError:
-        return None
+    except GitOpsError as exc:
+        return {"path": top.replace("\\", "/"), **_kind(top), "branch": "", "upstream": "",
+                "ahead": None, "behind": None, "dirty": 0, "error": str(exc)}
     return {
         "path": top.replace("\\", "/"),
         **_kind(top),
@@ -396,10 +401,13 @@ def _known_paths(top: str) -> tuple[set[str], list[dict]]:
 
 
 def check_paths(top: str, paths: list[str]) -> None:
+    """Every selected path must exist on disk or be named by status — directly, or as the
+    directory a deleted file used to live in (``deep`` for a removed ``deep/a.txt``)."""
     _guard_paths(paths)
     known, _files = _known_paths(top)
     missing = [p for p in paths
-               if not os.path.exists(os.path.join(top, p)) and p not in known]
+               if not os.path.exists(os.path.join(top, p))
+               and not any(_in_scope(k, [p]) for k in known)]
     if missing:
         raise GitOpsError(f"path not present in work tree: {', '.join(missing)}")
 
@@ -547,7 +555,12 @@ def file_diff(top: str, path: str, untracked: bool = False) -> tuple[str, bool]:
     holds: an untracked path has no diff at all, so read the file instead of asking git.
     """
     if not untracked:
-        text = _run(["diff", "HEAD", "--", path], cwd=top, timeout=60).stdout
+        proc = _run(["diff", "HEAD", "--", path], cwd=top, timeout=60)
+        text = proc.stdout
+        if proc.returncode != 0:
+            # No HEAD yet (a fresh `git init`): the index against the empty tree is all
+            # there is, and a staged new file still has its body to show.
+            text = _run(["diff", "--cached", "--", path], cwd=top, timeout=60).stdout
         if text.strip():
             return text[:DIFF_BUDGET], len(text) > DIFF_BUDGET
         # Empty against HEAD: unchanged, binary-free no-op, or a path git never tracked.
@@ -572,7 +585,10 @@ def commit_info(repo: str, paths: list[str], cwd: str, llm) -> dict:
     if not diff.strip():
         raise GitOpsError("no changes to describe")
     diff, redactions = _redact(diff)
-    history = _ok(top, "log", "-20", "--oneline", "--no-decorate").strip()
+    # `git log` fails on a repo with no commits yet; the history is only a style hint, so an
+    # unborn HEAD reads as an empty history instead of failing the first commit's message.
+    log = _run(["log", "-20", "--oneline", "--no-decorate"], cwd=top, timeout=20)
+    history = log.stdout.strip() if log.returncode == 0 else ""
     history, history_hits = _redact(history)
     redactions += history_hits
     instructions = (
@@ -658,11 +674,16 @@ def list_files(repo: str, cwd: str, include_untracked: bool = True) -> dict:
 def discard(repo: str, paths: list[str], cwd: str) -> dict:
     """Throw work-tree changes away for tracked paths (index and work tree back to HEAD).
 
-    Untracked paths are never deleted, and they no longer fail the call either: they come
-    back in ``skipped``, so one new file picked next to real edits cannot block the rest.
-    A path counts as discardable when git's own status names it — both sides of a rename,
-    and either column of a staged change: an index dump would misread a staged deletion
-    (gone from the index, still in HEAD) as untracked and refuse a restore git handles fine.
+    A path HEAD has never seen — untracked, staged but never committed ('A'), or a copy —
+    is a NEW file: discarding never deletes it. ``git restore --source=HEAD`` would, and
+    exits 0 while doing it, so those paths are filtered out before the call: they are only
+    unstaged (when they were staged) and come back in ``skipped``, so one new file picked
+    next to real edits cannot block the rest or disappear.
+    A selected rename row carries two paths, and both are restored: acting on the target
+    alone deletes it and leaves the source's staged deletion behind. A path counts as
+    discardable when git's own status names it — either column of a staged change: an index
+    dump would misread a staged deletion (gone from the index, still in HEAD) as untracked
+    and refuse a restore git handles fine.
 
     ``discarded`` lists the paths that are clean once this returns, so a restore that did
     nothing (no commit yet to restore from) reports ``discarded: []`` with the path in
@@ -673,20 +694,31 @@ def discard(repo: str, paths: list[str], cwd: str) -> dict:
     entries = _dirty(top)
     known = {p for entry in entries for p in (entry["path"], entry.get("from", "")) if p}
     untracked = {entry["path"] for entry in entries if entry["code"] == "??"}
-    tracked = [p for p in paths if p in known and p not in untracked]
+    # 'A' in either column is an added path (staged, or intent-to-add), 'C' a copy: never
+    # committed, so nothing to restore from and nothing that may be deleted.
+    fresh = {entry["path"] for entry in entries
+             if "A" in entry["code"][:2] or entry["code"][:1] == "C"}
+    rename_from = {entry["path"]: entry["from"] for entry in entries if entry.get("from")}
+    wanted = list(dict.fromkeys(w for p in paths for w in (p, rename_from.get(p)) if w))
+    stale = [p for p in wanted if p in fresh]                    # staged, never committed
+    new_files = {p for p in wanted if p in untracked} | set(stale)
+    tracked = [p for p in wanted if p in known and p not in new_files]
+    if stale:  # unstage only: the file itself stays on disk, like an untracked one
+        _run(["restore", "--staged", "--", *stale], cwd=top, timeout=GIT_TIMEOUT["commit"])
     if tracked:
         try:
             _ok(top, "restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked,
                 timeout=GIT_TIMEOUT["commit"])
         except GitOpsError:
-            # A file absent from HEAD cannot be restored from it: unstage, then check out.
+            # No HEAD yet (a fresh `git init`): there is nothing to restore from. Unstage
+            # what can be unstaged and let ``still_dirty`` report the rest — `git checkout
+            # --` cannot help here, an unstaged path is no longer in the index and checkout
+            # refuses it with "did not match any file(s) known to git".
             _run(["restore", "--staged", "--", *tracked], cwd=top, timeout=GIT_TIMEOUT["commit"])
-            _ok(top, "checkout", "--", *tracked, timeout=GIT_TIMEOUT["commit"])
     dirty_after = {f["path"] for f in _dirty(top)}
-    skipped = {p for p in paths if p not in set(tracked)}
     return {"path": top,
             "discarded": [p for p in tracked if p not in dirty_after],
-            "skipped": [p for p in paths if p in skipped],
+            "skipped": [p for p in paths if p not in set(tracked)],
             "still_dirty": [p for p in tracked if p in dirty_after]}
 
 
@@ -789,6 +821,8 @@ def _sync_submodules(top: str) -> Optional[dict]:
 
 def pull(repo: str, cwd: str, mode: str = "ff", submodules: bool = True) -> dict:
     top = resolve_repo(repo, cwd)
+    if mode not in ("ff", "rebase"):
+        raise GitOpsError("mode must be 'ff' or 'rebase'")
     state = _light_state(top)
     if state["branch"] == "DETACHED":
         raise GitOpsError("detached HEAD: refuse to pull")
@@ -811,18 +845,19 @@ def pull(repo: str, cwd: str, mode: str = "ff", submodules: bool = True) -> dict
                 "ahead": ahead, "behind": 0,
                 "submodules": _sync_submodules(top) if submodules else None,
                 "note": "already up to date"}
-    if ahead and behind:
-        raise GitOpsError(f"diverged: ahead {ahead}, behind {behind} — resolve by hand "
-                          "(rebase or merge), this tool does not create merge commits")
-    if mode not in ("ff", "rebase"):
-        raise GitOpsError("mode must be 'ff' or 'rebase'")
+    if ahead and behind and mode != "rebase":
+        # Only an explicit rebase replays local commits; the default never rewrites history.
+        raise GitOpsError(f"diverged: ahead {ahead}, behind {behind} — pass mode='rebase' to "
+                          "replay the local commits, or resolve by hand")
     # The fetch above already moved @{u}, so merge/rebase it directly: a second `git pull`
     # would repeat the network round trip and widen the race window for nothing.
-    command = ["merge", "--ff-only", "@{u}"] if mode == "ff" else ["rebase", "@{u}"]
+    command = ["rebase", "@{u}"] if mode == "rebase" else ["merge", "--ff-only", "@{u}"]
     proc = _run(command, cwd=top, timeout=GIT_TIMEOUT["pull"])
     if proc.returncode != 0:
-        raise GitOpsError((proc.stderr or proc.stdout).strip()
-                          or f"git {command[0]} failed after fetch")
+        advice = (" — resolve by hand (git rebase --continue / --abort)"
+                  if command[0] == "rebase" else "")
+        raise GitOpsError(((proc.stderr or proc.stdout).strip()
+                           or f"git {command[0]} failed after fetch") + advice)
     final = _porcelain(top, untracked=False)
     new = (final["oid"] or _ok(top, "rev-parse", "HEAD").strip())[:7]
     return {"path": top, "branch": state["branch"], "pulled": behind, "old": old, "new": new,

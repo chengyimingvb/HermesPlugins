@@ -176,12 +176,12 @@ const MESSAGES = {
       empty: '没有匹配的文件',
       emptyRepo: '(空仓库)'
     },
-    git: { noRepo: '未找到仓库', clean: '工作区干净', noGit: '无 Git 仓库' },
+    git: { noRepo: '未找到仓库', clean: '工作区干净', noGit: '无 Git 仓库', unreadable: '无法读取仓库状态' },
     tip: {
       row: '点击打开 diff（TortoiseGit / VS Code）',
       openFile: '点击用 VS Code 打开',
       copyPath: '复制工程内路径',
-      untracked: '未跟踪的新文件：放弃修改不会删除它'
+      untracked: '新文件：放弃修改不会删除它'
     },
     message: { placeholder: '提交信息（可留空，提交时自动生成）' },
     button: {
@@ -207,8 +207,8 @@ const MESSAGES = {
     diff: { truncated: 'diff 已截断', loading: '加载中…', failed: (m) => `无法读取 diff: ${m}` },
     discard: {
       title: '放弃修改？',
-      body: (n, untracked) => `将把 ${n} 个已跟踪文件的索引与工作区还原到 HEAD，不可撤销。`
-        + (untracked ? `另有 ${untracked} 个未跟踪的新文件不会被删除。` : '')
+      body: (n, fresh) => `将把 ${n} 个已跟踪文件的索引与工作区还原到 HEAD，不可撤销。`
+        + (fresh ? `另有 ${fresh} 个未提交的新文件不会被删除。` : '')
     },
     toast: {
       generated: (header, truncated) => `生成 ${header}${truncated ? '（diff 已截断）' : ''}`,
@@ -218,8 +218,8 @@ const MESSAGES = {
       committedNotPushed: '提交已保存，但推送失败',
       pulled: (n, from, to) => `拉取 ${n} 个提交 ${from}→${to}`,
       upToDate: '已是最新',
-      discarded: (n, untracked) => `已放弃 ${n} 个文件的修改`
-        + (untracked ? `，${untracked} 个未跟踪文件未删除` : ''),
+      discarded: (n, fresh) => `已放弃 ${n} 个文件的修改`
+        + (fresh ? `，${fresh} 个新文件未删除` : ''),
       failed: (m) => `失败: ${m}`,
       filesFailed: (m) => `加载文件列表失败: ${m}`,
       openFailed: (m) => `无法用 VS Code 打开: ${m}`,
@@ -248,12 +248,13 @@ const MESSAGES = {
       empty: 'No matching file',
       emptyRepo: '(empty repo)'
     },
-    git: { noRepo: 'No repository found', clean: 'Working tree clean', noGit: 'No git repository' },
+    git: { noRepo: 'No repository found', clean: 'Working tree clean', noGit: 'No git repository',
+           unreadable: 'Cannot read the repo status' },
     tip: {
       row: 'Click to open the diff (TortoiseGit / VS Code)',
       openFile: 'Click to open in VS Code',
       copyPath: 'Copy the repo-relative path',
-      untracked: 'Untracked new file: discarding never deletes it'
+      untracked: 'New file: discarding never deletes it'
     },
     message: { placeholder: 'Commit message (leave empty to generate one)' },
     button: {
@@ -279,8 +280,8 @@ const MESSAGES = {
     diff: { truncated: 'diff truncated', loading: 'Loading…', failed: (m) => `Cannot read the diff: ${m}` },
     discard: {
       title: 'Discard changes?',
-      body: (n, untracked) => `Index and work tree of ${n} tracked files go back to HEAD. Irreversible.`
-        + (untracked ? ` ${untracked} untracked new file(s) are not deleted.` : '')
+      body: (n, fresh) => `Index and work tree of ${n} tracked files go back to HEAD. Irreversible.`
+        + (fresh ? ` ${fresh} uncommitted new file(s) are not deleted.` : '')
     },
     toast: {
       generated: (header, truncated) => `Generated ${header}${truncated ? ' (diff truncated)' : ''}`,
@@ -290,8 +291,8 @@ const MESSAGES = {
       committedNotPushed: 'Commit saved, but the push failed',
       pulled: (n, from, to) => `Pulled ${n} commits ${from}→${to}`,
       upToDate: 'Already up to date',
-      discarded: (n, untracked) => `Discarded changes in ${n} files`
-        + (untracked ? `, kept ${untracked} untracked file(s)` : ''),
+      discarded: (n, fresh) => `Discarded changes in ${n} files`
+        + (fresh ? `, kept ${fresh} new file(s)` : ''),
       failed: (m) => `Failed: ${m}`,
       filesFailed: (m) => `Cannot load the file list: ${m}`,
       openFailed: (m) => `Cannot open it in VS Code: ${m}`,
@@ -345,6 +346,14 @@ function codeColor(code) {
   if (c[0] === 'T' || c[1] === 'T') return 'var(--ui-orange)'      // type changed
   if (c[0] === 'M' || c[1] === 'M') return 'var(--ui-yellow)'      // modified
   return undefined
+}
+
+// The backend's discard contract: a path HEAD has never seen is never deleted — untracked,
+// an add in either column (staged, or intent-to-add), or a copy. Those rows are only
+// unstaged, so the confirm dialog must not promise to throw their content away.
+function isNewFile(code) {
+  const c = code || ''
+  return c === '??' || c.slice(0, 2).includes('A') || c[0] === 'C'
 }
 
 // Small inline SVGs for the tree. currentColor keeps them theme-aware; the two slots
@@ -436,7 +445,7 @@ function FileList({ files, picked, onPick, onOpen }) {
         }),
         jsx('span', {
           className: 'flex min-w-0 flex-1 cursor-pointer items-center gap-2',
-          title: `${f.path} · ${t(f.code === '??' ? 'tip.untracked' : 'tip.row')}`,
+          title: `${f.path} · ${t(isNewFile(f.code) ? 'tip.untracked' : 'tip.row')}`,
           onClick: () => void onOpen(f.path, f.code),
           children: [
             jsx('span', { style: { ...MONO, ...(stColor ? { color: stColor } : MUTED) }, children: f.code }),
@@ -632,6 +641,11 @@ function GitPane() {
   // Workspace of the focused chat (falls back to the window cwd) — what the pane acts on.
   const [workspace, setWorkspace] = useState('')
   const base = workspace || cwd
+  // Why the last status probe failed — a repo git cannot read must never render as clean.
+  const [statusError, setStatusError] = useState('')
+  // The last change this pane heard about: an agent-side tool call (ctx.onEvent) or one of
+  // this pane's own mutations below. Read by the status refresh and the file index alike.
+  const change = useValue($gitChange)
 
   const toast = useCallback((text, kind = 'info') => {
     host.notify({ kind, message: text })
@@ -646,6 +660,7 @@ function GitPane() {
     try {
       const st = await api(`/status?repo=${enc(target)}&cwd=${enc(at || target)}`)
       setStatus(st)
+      setStatusError('')
       // The repo row carries its own copy of branch/ahead/behind/dirty (scan builds it); a
       // commit or push changes them without a re-scan, so fold the fresh status back in.
       setRepos((prev) => prev.map((r) => (normPath(r.path) === normPath(st.path)
@@ -659,6 +674,7 @@ function GitPane() {
       return st
     } catch (err) {
       setStatus(null)
+      setStatusError(err.message)
       console.warn('[git-ops] status', err.message)
       return null
     }
@@ -701,7 +717,6 @@ function GitPane() {
 
   useEffect(() => {
     let cancelled = false
-    setMessage('')
     void (async () => {
       let target = cwd
       if (sessionKey) {
@@ -720,17 +735,20 @@ function GitPane() {
         }
       }
       if (cancelled) return
-      // Same project (same resolved cwd) as already shown: keep the pane's data —
-      // switching between sessions in one workspace must not force a re-scan.
+      // Same project (same resolved cwd) as already shown: keep the pane's data, the draft
+      // commit message included — switching between sessions in one workspace must not
+      // force a re-scan.
       if (target === base && repos.length) {
         setWorkspace(target)
         return
       }
       setStatus(null)
+      setStatusError('')
       setPicked([])
       setRepos([])
       setRepo('')
       setDiff(null)
+      setMessage('')
       setWorkspace(target || '')
       if (target) await scan(target)
     })()
@@ -762,10 +780,14 @@ function GitPane() {
   // A suffix-list change misses every cached key (the suffix set is part of it), and
   // `loadFiles` above is re-created with it — the search-open effect below refetches.
   // Open the search (or switch repo) → fetch that repo's list once; the cache makes a
-  // close/reopen instant.
+  // close/reopen instant. A change for this repo (agent-side event, or the pane's own
+  // mutation — both bump `change`) dropped its cached entry, so the open panel refetches
+  // instead of keeping paths a commit just added or a pull just landed; a change for
+  // another repo leaves this cache warm and the call below costs nothing.
   useEffect(() => {
-    if (searchOpen && repo) void loadFiles(repo)
-  }, [searchOpen, repo, loadFiles])
+    if (!searchOpen || !repo) return
+    void loadFiles(repo)
+  }, [searchOpen, repo, loadFiles, change.seq])
 
   // The agent commits in the same repo from its own tool calls; without a poll the pane
   // would keep showing a stale file list until the user hit 刷新.
@@ -808,10 +830,9 @@ function GitPane() {
   }, [repo, base, busy, pollMs, refresh])
 
   // Event-driven refresh: the agent's own git_commit / git_push / git_pull / git_discard
-  // tool calls push plugin.git-ops.<kind> to this session. Only the seq matters — an event
-  // for another repo (or from another session, which ctx.onEvent already filtered) is
-  // skipped, and a replayed frame from a reconnect never fires here.
-  const change = useValue($gitChange)
+  // tool calls push plugin.git-ops.<kind> to this session (`change` above). Only the seq
+  // matters — an event for another repo (or from another session, which ctx.onEvent already
+  // filtered) is skipped, and a replayed frame from a reconnect never fires here.
   useEffect(() => {
     if (!change.seq || !repo) return
     if (change.repo && normPath(change.repo) !== normPath(repo)) return
@@ -880,9 +901,19 @@ function GitPane() {
     refreshedAt.current = Date.now()
     try {
       const data = await api(path, body)
-      // A mutation just landed in the working tree: the pane refreshes below, and the
-      // composer's coding bar needs the poke because REST emits no tool.complete.
-      if (poke && GIT_EVENTS.includes(kind)) pokeCodingBar()
+      if (GIT_EVENTS.includes(kind)) {
+        // A mutation just landed in the working tree. REST emits no plugin event, so the
+        // pane raises the same signal the agent's tool calls do: the repo's cached file
+        // index is dropped and an open search panel refetches. The status refresh stays
+        // ours (every caller refreshes when this returns), so the window is re-opened to
+        // keep the change effect from paying for a second one.
+        invalidateFiles(repo)
+        refreshedAt.current = Date.now()
+        const prev = $gitChange.get()
+        $gitChange.set({ seq: prev.seq + 1, kind, repo })
+        // The composer's coding bar needs the poke too: REST emits no tool.complete.
+        if (poke) pokeCodingBar()
+      }
       if (notify) toast(describe(data), 'success')
       return data
     } catch (err) {
@@ -892,7 +923,7 @@ function GitPane() {
     } finally {
       setBusy('')
     }
-  }, [t, toast])
+  }, [repo, t, toast])
 
   const generate = useCallback(async () => {
     if (!repo) return
@@ -943,10 +974,11 @@ function GitPane() {
   const repoReady = Boolean(repo) && repos.some((r) => r.path === repo)
   const disabled = !repoReady || Boolean(busy)
   const allPicked = files.length > 0 && picked.length === files.length
-  // Discard is per-file, never all-or-nothing: the backend skips untracked paths and says
-  // how many, so the confirm dialog counts the same way the call will act.
-  const pickedUntracked = files.filter((f) => picked.includes(f.path) && f.code === '??').length
-  const pickedTracked = picked.length - pickedUntracked
+  // Discard is per-file, never all-or-nothing: the backend keeps every new file (untracked,
+  // or staged and never committed) and says how many, so the confirm dialog counts the same
+  // way the call will act.
+  const pickedNew = files.filter((f) => picked.includes(f.path) && isNewFile(f.code)).length
+  const pickedTracked = picked.length - pickedNew
   // Client-side search filter: term matches anywhere in the repo-relative path,
   // suffix matches the bytes after the last dot ('.py' and '*.py' both accepted).
   const visibleFiles = useMemo(() => {
@@ -1040,6 +1072,7 @@ function GitPane() {
                   setMessage('')
                   setDiff(null)
                   setPicked([])
+                  setStatusError('')
                   void refresh(r.path, base, true)
                 },
                 className: 'flex w-full items-center gap-1 px-1.5 py-1 text-left text-xs',
@@ -1049,11 +1082,12 @@ function GitPane() {
                   color: 'var(--ui-text-primary)',
                   fontWeight: active ? 500 : 400
                 },
-                title: r.path,
+                title: r.error || r.path,
                 children: [
                   jsx('span', { className: 'truncate', children: `${r.kind === 'submodule' ? '↳ ' : ''}${r.path.split('/').pop()}` }),
                   jsx('span', { className: 'ml-auto shrink-0', style: MUTED,
-                    children: `${r.branch} ↑${r.ahead ?? '?'} ↓${r.behind ?? '?'}${r.dirty ? ` *${r.dirty}` : ''}` })
+                    children: r.error ? t('git.unreadable')
+                      : `${r.branch} ↑${r.ahead ?? '?'} ↓${r.behind ?? '?'}${r.dirty ? ` *${r.dirty}` : ''}` })
                 ]
               }, r.path)
             })
@@ -1064,7 +1098,9 @@ function GitPane() {
         : jsx('div', {
             className: 'min-h-0 flex-1 overflow-auto rounded border p-1 text-xs',
             style: { ...STROKE, ...MUTED },
-            children: jsx('div', { className: 'p-1', children: repoReady ? t('git.clean') : t('git.noGit') })
+            // A failed probe is never dressed up as a clean tree.
+            children: jsx('div', { className: 'p-1',
+              children: !repoReady ? t('git.noGit') : statusError || t('git.clean') })
           }),
       jsx(Textarea, {
         value: message,
@@ -1138,7 +1174,7 @@ function GitPane() {
                 children: jsx(DialogTitle, { className: 'text-sm', children: t('discard.title') })
               }),
               jsx('div', { className: 'text-xs', style: MUTED,
-                children: t('discard.body', pickedTracked, pickedUntracked) }),
+                children: t('discard.body', pickedTracked, pickedNew) }),
               jsxs('div', { className: 'flex justify-end gap-2', children: [
                 jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => setConfirmDiscard(false),
                   children: t('button.cancel') }),

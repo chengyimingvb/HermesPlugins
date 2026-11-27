@@ -88,7 +88,8 @@ _TOOLS = [
         "name": "git_repos",
         "description": "List every git work tree under one or more roots, submodules included. "
                        "Each entry reports kind (main/submodule), parent, branch, upstream, "
-                       "ahead/behind and dirty count. Start here for multi-repo work.",
+                       "ahead/behind and dirty count; a work tree git cannot read comes back "
+                       "with 'error' on the entry. Start here for multi-repo work.",
         "parameters": {"type": "object", "properties": {
             "roots": {"type": "array", "items": {"type": "string"},
                       "description": "Directories to scan. Omit to scan the session cwd."},
@@ -153,13 +154,16 @@ _TOOLS = [
         "name": "git_pull",
         "description": "Fetch, then fast-forward (default) or rebase the current branch, then sync "
                        "submodule URLs and initialise missing/detached submodules. A submodule "
-                       "checked out on a branch stays on it. Diverged branches are refused, not merged.",
+                       "checked out on a branch stays on it. A diverged branch is refused unless "
+                       "mode='rebase', which replays the local commits onto the upstream.",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO,
             "roots": {"type": "array", "items": {"type": "string"},
                       "description": "Batch mode: pull every repo found under these roots, "
                                      "one at a time, parents before their submodules."},
-            "mode": {"type": "string", "enum": ["ff", "rebase"], "description": "Default 'ff'."},
+            "mode": {"type": "string", "enum": ["ff", "rebase"],
+                     "description": "Default 'ff' (fast-forward only). 'rebase' also replays "
+                                    "local commits when the branch has diverged."},
             "submodules": {"type": "boolean",
                                      "description": "Sync submodule URLs and init missing/detached ones; "
                                                     "on-branch submodules are left alone (default true)."},
@@ -168,9 +172,10 @@ _TOOLS = [
     ("git_discard", {
         "name": "git_discard",
         "description": "Throw away work-tree changes for explicit tracked paths (index and work tree "
-                       "back to HEAD). Irreversible. Untracked paths are never deleted — they are "
-                       "reported in 'skipped' instead of failing the call, and 'still_dirty' lists "
-                       "whatever stayed dirty.",
+                       "back to HEAD). Irreversible. A new file (untracked, or staged and never "
+                       "committed) is never deleted — it is only unstaged and reported in 'skipped'; "
+                       "a selected rename restores both sides, and 'still_dirty' lists whatever "
+                       "stayed dirty.",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO,
             "paths": _PATHS,
